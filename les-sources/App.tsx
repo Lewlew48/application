@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
+import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { StatusBar } from 'expo-status-bar';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
@@ -57,6 +58,8 @@ type VisibleEvent = {
   points: EventTrackPoint[];
 };
 
+type EventPickerTarget = 'date' | 'startTime' | 'endTime' | null;
+
 const STORAGE_KEY = 'les-sources-users-v1';
 const STORAGE_LOCATIONS_KEY = 'les-sources-locations-v1';
 const STORAGE_EVENTS_KEY = 'les-sources-events-v1';
@@ -78,6 +81,18 @@ const DEFAULT_MAP_REGION = {
 };
 
 const EVENT_COLORS = ['#ef4444', '#2563eb', '#f59e0b', '#10b981', '#8b5cf6'];
+
+const formatTime = (date: Date) => {
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  return `${hours}:${minutes}`;
+};
+
+const mergeDateAndTime = (dateSource: Date, timeSource: Date) => {
+  const merged = new Date(dateSource);
+  merged.setHours(timeSource.getHours(), timeSource.getMinutes(), 0, 0);
+  return merged;
+};
 
 const getLocalDateKey = (date: Date) => {
   const year = date.getFullYear();
@@ -139,6 +154,11 @@ export default function App() {
   const [eventGpxText, setEventGpxText] = useState('');
   const [eventGpxFileName, setEventGpxFileName] = useState('');
   const [eventVisibleForVolunteers, setEventVisibleForVolunteers] = useState(false);
+  const [eventDateValue, setEventDateValue] = useState<Date | null>(null);
+  const [eventStartTimeValue, setEventStartTimeValue] = useState<Date | null>(null);
+  const [eventEndTimeValue, setEventEndTimeValue] = useState<Date | null>(null);
+  const [eventPickerTarget, setEventPickerTarget] = useState<EventPickerTarget>(null);
+  const [eventPickerValue, setEventPickerValue] = useState(new Date());
 
   useEffect(() => {
     loadUsers();
@@ -241,6 +261,61 @@ export default function App() {
     } catch {
       Alert.alert('Erreur', 'Impossible de lire le fichier GPX.');
     }
+  };
+
+  const openEventDatePicker = () => {
+    setEventPickerTarget('date');
+    setEventPickerValue(eventDateValue ?? new Date());
+  };
+
+  const openEventStartTimePicker = () => {
+    setEventPickerTarget('startTime');
+    setEventPickerValue(eventStartTimeValue ?? new Date());
+  };
+
+  const openEventEndTimePicker = () => {
+    setEventPickerTarget('endTime');
+    setEventPickerValue(eventEndTimeValue ?? new Date());
+  };
+
+  const handleEventPickerChange = (pickerEvent: DateTimePickerEvent, selectedValue?: Date) => {
+    if (pickerEvent.type === 'dismissed' || !selectedValue) {
+      setEventPickerTarget(null);
+      return;
+    }
+
+    if (eventPickerTarget === 'date') {
+      setEventDateValue(selectedValue);
+      setEventDate(getLocalDateKey(selectedValue));
+
+      if (eventStartTimeValue) {
+        const mergedStart = mergeDateAndTime(selectedValue, eventStartTimeValue);
+        setEventStartTimeValue(mergedStart);
+        setEventStartTime(formatTime(mergedStart));
+      }
+
+      if (eventEndTimeValue) {
+        const mergedEnd = mergeDateAndTime(selectedValue, eventEndTimeValue);
+        setEventEndTimeValue(mergedEnd);
+        setEventEndTime(formatTime(mergedEnd));
+      }
+    }
+
+    if (eventPickerTarget === 'startTime') {
+      const baseDate = eventDateValue ?? new Date();
+      const mergedStart = mergeDateAndTime(baseDate, selectedValue);
+      setEventStartTimeValue(mergedStart);
+      setEventStartTime(formatTime(mergedStart));
+    }
+
+    if (eventPickerTarget === 'endTime') {
+      const baseDate = eventDateValue ?? new Date();
+      const mergedEnd = mergeDateAndTime(baseDate, selectedValue);
+      setEventEndTimeValue(mergedEnd);
+      setEventEndTime(formatTime(mergedEnd));
+    }
+
+    setEventPickerTarget(null);
   };
 
   const updateUserLocation = async (
@@ -379,6 +454,10 @@ export default function App() {
     setEventGpxText('');
     setEventGpxFileName('');
     setEventVisibleForVolunteers(false);
+    setEventDateValue(null);
+    setEventStartTimeValue(null);
+    setEventEndTimeValue(null);
+    setEventPickerTarget(null);
   };
 
   const handleLogin = () => {
@@ -667,33 +746,33 @@ export default function App() {
             <Text style={styles.sectionTitle}>Creer un evenement</Text>
             <TextInput
               style={styles.input}
-              placeholder="Nom de l evenement"
+              placeholder="Nom de l evenement (ex: Trail des Sources)"
               value={eventName}
               onChangeText={setEventName}
             />
             <View style={styles.fieldRow}>
-              <TextInput
-                style={[styles.input, styles.halfInput]}
-                placeholder="Date YYYY-MM-DD"
-                value={eventDate}
-                onChangeText={setEventDate}
-                autoCapitalize="none"
-              />
-              <TextInput
-                style={[styles.input, styles.halfInput]}
-                placeholder="Debut HH:MM"
-                value={eventStartTime}
-                onChangeText={setEventStartTime}
-                autoCapitalize="none"
-              />
+              <Pressable
+                style={[styles.selectorField, styles.halfInput]}
+                onPress={openEventDatePicker}
+              >
+                <Text style={eventDate ? styles.selectorText : styles.selectorPlaceholderText}>
+                  {eventDate || 'Selectionner la date'}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[styles.selectorField, styles.halfInput]}
+                onPress={openEventStartTimePicker}
+              >
+                <Text style={eventStartTime ? styles.selectorText : styles.selectorPlaceholderText}>
+                  {eventStartTime || 'Heure de debut'}
+                </Text>
+              </Pressable>
             </View>
-            <TextInput
-              style={styles.input}
-              placeholder="Fin HH:MM"
-              value={eventEndTime}
-              onChangeText={setEventEndTime}
-              autoCapitalize="none"
-            />
+            <Pressable style={styles.selectorField} onPress={openEventEndTimePicker}>
+              <Text style={eventEndTime ? styles.selectorText : styles.selectorPlaceholderText}>
+                {eventEndTime || 'Heure de fin'}
+              </Text>
+            </Pressable>
             <View style={styles.checkboxRow}>
               <Pressable
                 style={[styles.checkbox, eventVisibleForVolunteers && styles.checkboxActive]}
@@ -756,14 +835,14 @@ export default function App() {
             <Text style={styles.sectionTitle}>Creer un utilisateur</Text>
             <TextInput
               style={styles.input}
-              placeholder="Nom d utilisateur"
+              placeholder="Nom d utilisateur (ex: benevole01)"
               value={newUsername}
               onChangeText={setNewUsername}
               autoCapitalize="none"
             />
             <TextInput
               style={styles.input}
-              placeholder="Mot de passe"
+              placeholder="Mot de passe (min. 4 caracteres)"
               value={newPassword}
               onChangeText={setNewPassword}
               secureTextEntry
@@ -841,6 +920,16 @@ export default function App() {
           </View>
         </ScrollView>
       )}
+
+      {eventPickerTarget && (
+        <DateTimePicker
+          value={eventPickerValue}
+          mode={eventPickerTarget === 'date' ? 'date' : 'time'}
+          is24Hour
+          display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+          onChange={handleEventPickerChange}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -882,6 +971,24 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     backgroundColor: '#ffffff',
     fontSize: 16,
+  },
+  selectorField: {
+    borderWidth: 1,
+    borderColor: '#bcccdc',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: '#ffffff',
+    justifyContent: 'center',
+    minHeight: 48,
+  },
+  selectorText: {
+    fontSize: 16,
+    color: '#102a43',
+  },
+  selectorPlaceholderText: {
+    fontSize: 16,
+    color: '#9aa5b1',
   },
   button: {
     backgroundColor: '#0f766e',
