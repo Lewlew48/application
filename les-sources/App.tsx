@@ -244,11 +244,17 @@ const parseGpxTrackPoints = (gpxText: string): EventTrackPoint[] => {
 };
 
 const isEventVisibleForUser = (event: EventItem, role: Role) => {
+  const isToday = event.date === getLocalDateKey(new Date());
+
+  if (isToday) {
+    return true;
+  }
+
   if (event.showForVolunteers) {
     return role === 'admin' || role === 'benevole';
   }
 
-  return event.date === getLocalDateKey(new Date());
+  return false;
 };
 
 export default function App() {
@@ -296,6 +302,11 @@ export default function App() {
 
   const mapRef = useRef<MapView | null>(null);
   const previousNavigationPositionRef = useRef<{ latitude: number; longitude: number } | null>(null);
+  const currentHeadingRef = useRef(0);
+  const navigationModeRef = useRef<NavigationMode>('normal');
+  const nextWaypointIndexRef = useRef(0);
+  const showOffRouteAlertRef = useRef(false);
+  const activeEventPointsRef = useRef<EventTrackPoint[]>([]);
 
   const [accountUsername, setAccountUsername] = useState('');
   const [accountPassword, setAccountPassword] = useState('');
@@ -702,6 +713,19 @@ export default function App() {
     }
   };
 
+  const handleDeleteEvent = async (eventId: string) => {
+    const nextEvents = events.filter((event) => event.id !== eventId);
+    await persistEvents(nextEvents);
+
+    if (activeEventId === eventId) {
+      handleStopEventNavigation();
+    }
+
+    if (selectedEventId === eventId) {
+      setSelectedEventId(null);
+    }
+  };
+
   const activeEvent = useMemo(() => {
     if (!activeEventId) {
       return null;
@@ -831,6 +855,30 @@ export default function App() {
       return;
     }
 
+    currentHeadingRef.current = currentHeading;
+  }, [currentHeading]);
+
+  useEffect(() => {
+    navigationModeRef.current = navigationMode;
+  }, [navigationMode]);
+
+  useEffect(() => {
+    nextWaypointIndexRef.current = nextWaypointIndex;
+  }, [nextWaypointIndex]);
+
+  useEffect(() => {
+    showOffRouteAlertRef.current = showOffRouteAlert;
+  }, [showOffRouteAlert]);
+
+  useEffect(() => {
+    activeEventPointsRef.current = activeEventPoints;
+  }, [activeEventPoints]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      return;
+    }
+
     let locationSubscription: Location.LocationSubscription | null = null;
     let isMounted = true;
 
@@ -867,7 +915,8 @@ export default function App() {
             updatedLocation.longitude
           );
 
-          if (currentUser.role !== 'participant' || !activeEventId || activeEventPoints.length < 2) {
+          const currentEventPoints = activeEventPointsRef.current;
+          if (currentUser.role !== 'participant' || !activeEventId || currentEventPoints.length < 2) {
             return;
           }
 
@@ -879,31 +928,30 @@ export default function App() {
             }
           }
           previousNavigationPositionRef.current = updatedLocation;
-
-          const currentTarget = activeEventPoints[Math.min(nextWaypointIndex, activeEventPoints.length - 1)];
+          const currentTarget = currentEventPoints[Math.min(nextWaypointIndexRef.current, currentEventPoints.length - 1)];
           const distanceToTarget = haversineDistanceMeters(updatedLocation, currentTarget);
-          if (distanceToTarget < 15 && nextWaypointIndex < activeEventPoints.length - 1) {
-            setNextWaypointIndex((value: number) => Math.min(value + 1, activeEventPoints.length - 1));
+          if (distanceToTarget < 15 && nextWaypointIndexRef.current < currentEventPoints.length - 1) {
+            setNextWaypointIndex((value: number) => Math.min(value + 1, currentEventPoints.length - 1));
           }
 
-          const routeDistance = distanceToPolylineMeters(updatedLocation, activeEventPoints);
+          const routeDistance = distanceToPolylineMeters(updatedLocation, currentEventPoints);
           setOffRouteDistanceMeters(routeDistance);
 
-          if (routeDistance > 10 && !showOffRouteAlert) {
+          if (routeDistance > 10 && !showOffRouteAlertRef.current) {
             setShowOffRouteAlert(true);
             Alert.alert('Alerte parcours', 'Tu t éloignes du parcours de plus de 10 m.');
           }
 
-          if (routeDistance <= 10 && showOffRouteAlert) {
+          if (routeDistance <= 10 && showOffRouteAlertRef.current) {
             setShowOffRouteAlert(false);
           }
 
-          if (navigationMode === 'normal' && mapRef.current) {
+          if (navigationModeRef.current === 'normal' && mapRef.current) {
             const zoom = distanceToTarget < 35 ? 18 : 16;
             mapRef.current.animateCamera(
               {
                 center: updatedLocation,
-                heading: normalizeDegrees(currentHeading),
+                heading: normalizeDegrees(currentHeadingRef.current),
                 pitch: 45,
                 zoom,
               },
@@ -924,12 +972,7 @@ export default function App() {
     };
   }, [
     activeEventId,
-    activeEventPoints,
-    currentHeading,
     currentUser,
-    navigationMode,
-    nextWaypointIndex,
-    showOffRouteAlert,
   ]);
 
   const handleUpdateAccount = async () => {
@@ -1475,29 +1518,41 @@ export default function App() {
               value={eventName}
               onChangeText={setEventName}
             />
-            <View style={styles.fieldRow}>
+            <View style={styles.eventFieldGroup}>
+              <Text style={styles.eventFieldLabel}>Date</Text>
               <Pressable
-                style={[styles.selectorField, styles.halfInput]}
+                style={[styles.selectorField, styles.selectorDateField]}
                 onPress={openEventDatePicker}
               >
                 <Text style={eventDate ? styles.selectorText : styles.selectorPlaceholderText}>
-                  {eventDate || 'Selectionner la date'}
-                </Text>
-              </Pressable>
-              <Pressable
-                style={[styles.selectorField, styles.halfInput]}
-                onPress={openEventStartTimePicker}
-              >
-                <Text style={eventStartTime ? styles.selectorText : styles.selectorPlaceholderText}>
-                  {eventStartTime || 'Heure de debut'}
+                  {eventDate || 'Sélectionner la date'}
                 </Text>
               </Pressable>
             </View>
-            <Pressable style={styles.selectorField} onPress={openEventEndTimePicker}>
-              <Text style={eventEndTime ? styles.selectorText : styles.selectorPlaceholderText}>
-                {eventEndTime || 'Heure de fin'}
-              </Text>
-            </Pressable>
+            <View style={styles.fieldRow}>
+              <View style={[styles.eventFieldGroup, styles.halfInput]}>
+                <Text style={styles.eventFieldLabel}>Heure de début</Text>
+                <Pressable
+                  style={styles.selectorField}
+                  onPress={openEventStartTimePicker}
+                >
+                  <Text style={eventStartTime ? styles.selectorText : styles.selectorPlaceholderText}>
+                    {eventStartTime || 'Choisir'}
+                  </Text>
+                </Pressable>
+              </View>
+              <View style={[styles.eventFieldGroup, styles.halfInput]}>
+                <Text style={styles.eventFieldLabel}>Heure de fin</Text>
+                <Pressable
+                  style={styles.selectorField}
+                  onPress={openEventEndTimePicker}
+                >
+                  <Text style={eventEndTime ? styles.selectorText : styles.selectorPlaceholderText}>
+                    {eventEndTime || 'Choisir'}
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
             <View style={styles.checkboxRow}>
               <Pressable
                 style={[styles.checkbox, eventVisibleForVolunteers && styles.checkboxActive]}
@@ -1536,6 +1591,7 @@ export default function App() {
                   const visibilityLabel = event.showForVolunteers
                     ? 'Bénévoles + admins'
                     : 'Visible aujourd hui pour tous';
+                  const isToday = event.date === getLocalDateKey(new Date());
 
                   return (
                     <View key={event.id} style={styles.eventCard}>
@@ -1543,11 +1599,22 @@ export default function App() {
                         <View style={styles.eventCardTitleBlock}>
                           <Text style={styles.eventCardTitle}>{event.name}</Text>
                           <Text style={styles.eventCardMeta}>
-                            {event.date} de {event.startTime} a {event.endTime}
+                            {event.date} {isToday ? '(aujourd hui)' : ''}
+                          </Text>
+                          <Text style={styles.eventCardMeta}>
+                            {event.startTime} - {event.endTime}
                           </Text>
                         </View>
-                        <View style={styles.eventBadge}>
-                          <Text style={styles.eventBadgeText}>{visibilityLabel}</Text>
+                        <View style={styles.eventHeaderActions}>
+                          <View style={styles.eventBadge}>
+                            <Text style={styles.eventBadgeText}>{visibilityLabel}</Text>
+                          </View>
+                          <Pressable
+                            style={styles.deleteEventButton}
+                            onPress={() => handleDeleteEvent(event.id)}
+                          >
+                            <Text style={styles.deleteEventButtonText}>Supprimer</Text>
+                          </Pressable>
                         </View>
                       </View>
                       <Text style={styles.eventCardMeta}>{trackPoints.length} points GPX</Text>
@@ -2252,8 +2319,20 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 10,
   },
+  eventFieldGroup: {
+    gap: 6,
+  },
+  eventFieldLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#334e68',
+  },
   halfInput: {
     flex: 1,
+  },
+  selectorDateField: {
+    backgroundColor: '#f0fdfa',
+    borderColor: '#0f766e',
   },
   gpxInput: {
     minHeight: 140,
@@ -2335,6 +2414,10 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     gap: 10,
   },
+  eventHeaderActions: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
   eventCardTitleBlock: {
     flex: 1,
   },
@@ -2356,6 +2439,19 @@ const styles = StyleSheet.create({
   },
   eventBadgeText: {
     color: '#0f766e',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  deleteEventButton: {
+    borderWidth: 1,
+    borderColor: '#ef4444',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    backgroundColor: '#fff1f2',
+  },
+  deleteEventButtonText: {
+    color: '#b91c1c',
     fontSize: 12,
     fontWeight: '700',
   },
