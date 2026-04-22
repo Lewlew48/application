@@ -20,7 +20,7 @@ import {
 import MapView, { Marker, Polyline } from 'react-native-maps';
 
 type Role = 'admin' | 'benevole' | 'participant';
-type Page = 'admin' | 'carte';
+type Page = 'admin' | 'carte' | 'compte';
 
 type User = {
   id: string;
@@ -160,11 +160,25 @@ export default function App() {
   const [eventPickerTarget, setEventPickerTarget] = useState<EventPickerTarget>(null);
   const [eventPickerValue, setEventPickerValue] = useState(new Date());
 
+  const [accountUsername, setAccountUsername] = useState('');
+  const [accountPassword, setAccountPassword] = useState('');
+
   useEffect(() => {
     loadUsers();
     loadUserLocations();
     loadEvents();
   }, []);
+
+  useEffect(() => {
+    if (!currentUser) {
+      setAccountUsername('');
+      setAccountPassword('');
+      return;
+    }
+
+    setAccountUsername(currentUser.username);
+    setAccountPassword(currentUser.password);
+  }, [currentUser]);
 
   const sortedUsers = useMemo(() => {
     return [...users].sort((a, b) => {
@@ -533,6 +547,48 @@ export default function App() {
     }
   };
 
+  const handleUpdateAccount = async () => {
+    if (!currentUser) {
+      return;
+    }
+
+    const username = accountUsername.trim();
+    const password = accountPassword.trim();
+
+    if (!username || !password) {
+      Alert.alert('Erreur', 'Le nom d utilisateur et le mot de passe sont obligatoires.');
+      return;
+    }
+
+    const isDuplicateUsername = users.some(
+      (u: User) => u.id !== currentUser.id && u.username.toLowerCase() === username.toLowerCase()
+    );
+    if (isDuplicateUsername) {
+      Alert.alert('Erreur', 'Ce nom d utilisateur existe deja.');
+      return;
+    }
+
+    const updatedUser: User = {
+      ...currentUser,
+      username,
+      password,
+    };
+
+    const nextUsers = users.map((u: User) => (u.id === currentUser.id ? updatedUser : u));
+    await persistUsers(nextUsers);
+    setCurrentUser(updatedUser);
+
+    if (currentUser.username !== username) {
+      const nextLocations = userLocations.map((loc: UserLocation) =>
+        loc.userId === currentUser.id ? { ...loc, username } : loc
+      );
+      setUserLocations(nextLocations);
+      await AsyncStorage.setItem(STORAGE_LOCATIONS_KEY, JSON.stringify(nextLocations));
+    }
+
+    Alert.alert('Succès', 'Ton compte a ete mis a jour.');
+  };
+
   const visibleEvents: VisibleEvent[] = useMemo(() => {
     if (!currentUser) {
       return [];
@@ -630,6 +686,14 @@ export default function App() {
         >
           <Text style={[styles.navTabText, currentPage === 'carte' && styles.navTabTextActive]}>
             Carte
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.navTab, currentPage === 'compte' && styles.navTabActive]}
+          onPress={() => setCurrentPage('compte')}
+        >
+          <Text style={[styles.navTabText, currentPage === 'compte' && styles.navTabTextActive]}>
+            Mon Compte
           </Text>
         </Pressable>
         {currentUser.role === 'admin' && (
@@ -740,7 +804,37 @@ export default function App() {
             </View>
           </View>
         </View>
-      ) : (
+      ) : currentPage === 'compte' ? (
+        <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
+          <View style={styles.accountContainer}>
+            <View style={styles.accountAvatar}>
+              <View style={styles.accountAvatarHead} />
+              <View style={styles.accountAvatarBody} />
+            </View>
+            <Text style={styles.accountTitle}>Mon Compte</Text>
+            <Text style={styles.accountSubtitle}>Modifie ton nom d utilisateur et ton mot de passe.</Text>
+
+            <TextInput
+              style={styles.input}
+              placeholder="Nouveau nom d utilisateur"
+              value={accountUsername}
+              onChangeText={setAccountUsername}
+              autoCapitalize="none"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Nouveau mot de passe"
+              value={accountPassword}
+              onChangeText={setAccountPassword}
+              secureTextEntry
+            />
+
+            <Pressable style={styles.button} onPress={handleUpdateAccount}>
+              <Text style={styles.buttonText}>Enregistrer mes modifications</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+      ) : currentUser.role === 'admin' ? (
         <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
           <View style={styles.adminContainer}>
             <Text style={styles.sectionTitle}>Creer un evenement</Text>
@@ -917,6 +1011,13 @@ export default function App() {
                 </View>
               )}
             />
+          </View>
+        </ScrollView>
+      ) : (
+        <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
+          <View style={styles.accountContainer}>
+            <Text style={styles.accountTitle}>Acces refuse</Text>
+            <Text style={styles.accountSubtitle}>Cette section est reservee aux administrateurs.</Text>
           </View>
         </ScrollView>
       )}
@@ -1187,6 +1288,52 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 16,
     paddingBottom: 20,
+  },
+  accountContainer: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#d9e2ec',
+    backgroundColor: '#ffffff',
+    padding: 16,
+    gap: 10,
+  },
+  accountAvatar: {
+    alignSelf: 'center',
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    borderWidth: 2,
+    borderColor: '#0f766e',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 6,
+    backgroundColor: '#f0fdfa',
+  },
+  accountAvatarHead: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#0f766e',
+    marginBottom: 6,
+  },
+  accountAvatarBody: {
+    width: 34,
+    height: 18,
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+    backgroundColor: '#0f766e',
+  },
+  accountTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#102a43',
+    textAlign: 'center',
+  },
+  accountSubtitle: {
+    fontSize: 14,
+    color: '#627d98',
+    textAlign: 'center',
+    marginBottom: 8,
   },
   carteInfo: {
     fontSize: 14,
