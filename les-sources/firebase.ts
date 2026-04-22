@@ -5,6 +5,7 @@ type FirebaseConfig = {
 };
 
 type FirebaseExtra = Partial<FirebaseConfig>;
+const DEFAULT_DATABASE_URL = 'https://les-sources-66f43-default-rtdb.firebaseio.com';
 
 type ConstantsWithLegacyManifest = typeof Constants & {
   manifest?: {
@@ -31,8 +32,13 @@ const resolvedExtra: FirebaseExtra = {
   ...extraFromExpoConfig,
 };
 
+const globalEnv = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+
 const databaseUrlRaw =
-  process.env.EXPO_PUBLIC_FIREBASE_DATABASE_URL ?? resolvedExtra.databaseURL ?? '';
+  process.env.EXPO_PUBLIC_FIREBASE_DATABASE_URL ??
+  globalEnv?.EXPO_PUBLIC_FIREBASE_DATABASE_URL ??
+  resolvedExtra.databaseURL ??
+  DEFAULT_DATABASE_URL;
 
 const normalizeDatabaseUrl = (value: string) => value.trim().replace(/\/+$/, '');
 const databaseUrl = normalizeDatabaseUrl(databaseUrlRaw);

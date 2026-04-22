@@ -908,6 +908,11 @@ export default function App() {
     Alert.alert('Urgence envoyee', 'Les administrateurs ont ete notifies. Appel auto dans 5 secondes.');
   };
 
+  const handleDeleteEmergencyAlert = async (alertId: string) => {
+    const nextAlerts = emergencyAlerts.filter((alert: EmergencyAlert) => alert.id !== alertId);
+    await persistEmergencyAlerts(nextAlerts);
+  };
+
   useEffect(() => {
     if (emergencyCountdown === null) {
       return;
@@ -969,29 +974,49 @@ export default function App() {
   const fitNormalNavigationViewport = (
     locationPoint: { latitude: number; longitude: number } | null,
     routePoints: EventTrackPoint[],
-    nextIndex: number
+    nextIndex: number,
+    options?: { hasTopOverlay?: boolean; hasBottomOverlay?: boolean }
   ) => {
     if (!mapRef.current || !locationPoint || routePoints.length < 2) {
       return;
     }
 
     const fromIndex = Math.min(Math.max(0, nextIndex), routePoints.length - 1);
-    const nextPoints = routePoints.slice(fromIndex, Math.min(fromIndex + 7, routePoints.length));
+    const nextPoints = routePoints.slice(fromIndex, Math.min(fromIndex + 6, routePoints.length));
     const pointsToFit = [locationPoint, ...nextPoints];
 
     if (pointsToFit.length < 2) {
       return;
     }
 
+    const topPadding = options?.hasTopOverlay ? 180 : 90;
+    const bottomPadding = options?.hasBottomOverlay ? 250 : 150;
+
     mapRef.current.fitToCoordinates(pointsToFit, {
       edgePadding: {
-        top: 90,
+        top: topPadding,
         right: 70,
-        bottom: 190,
+        bottom: bottomPadding,
         left: 70,
       },
       animated: true,
     });
+  };
+
+  const handleRecenterMap = () => {
+    if (!mapRef.current || !currentLocation) {
+      return;
+    }
+
+    mapRef.current.animateToRegion(
+      {
+        latitude: currentLocation.latitude,
+        longitude: currentLocation.longitude,
+        latitudeDelta: 0.04,
+        longitudeDelta: 0.02,
+      },
+      500
+    );
   };
 
   useEffect(() => {
@@ -999,7 +1024,12 @@ export default function App() {
       return;
     }
 
-    fitNormalNavigationViewport(currentLocation, activeEventPoints, nextWaypointIndex);
+    const hasTopOverlay = currentUser.role === 'admin' && emergencyAlerts.length > 0;
+    const hasBottomOverlay = true;
+    fitNormalNavigationViewport(currentLocation, activeEventPoints, nextWaypointIndex, {
+      hasTopOverlay,
+      hasBottomOverlay,
+    });
   }, [activeEventId, activeEventPoints, currentLocation, currentUser?.role, navigationMode, nextWaypointIndex]);
 
   useEffect(() => {
@@ -1114,10 +1144,16 @@ export default function App() {
           }
 
           if (navigationModeRef.current === 'normal' && mapRef.current) {
+            const hasTopOverlay = currentUser.role === 'admin' && emergencyAlerts.length > 0;
+            const hasBottomOverlay = true;
             fitNormalNavigationViewport(
               updatedLocation,
               currentEventPoints,
-              nextWaypointIndexRef.current
+              nextWaypointIndexRef.current,
+              {
+                hasTopOverlay,
+                hasBottomOverlay,
+              }
             );
           }
         }
@@ -1141,6 +1177,7 @@ export default function App() {
   }, [
     activeEventId,
     currentUser,
+    emergencyAlerts.length,
   ]);
 
   const handleUpdateAccount = async () => {
@@ -1476,7 +1513,6 @@ export default function App() {
                   ref={(instance: any) => {
                     mapRef.current = instance;
                   }}
-                  key={currentLocation ? `${currentLocation.latitude}-${currentLocation.longitude}` : 'default-map'}
                   style={styles.map}
                   initialRegion={
                     currentLocation
@@ -1627,6 +1663,12 @@ export default function App() {
                 </View>
               )}
 
+              {canRenderNativeMap && currentLocation && !isParticipantNavigationActive && (
+                <Pressable style={styles.recenterButton} onPress={handleRecenterMap}>
+                  <Text style={styles.recenterButtonText}>Recentrer</Text>
+                </Pressable>
+              )}
+
               {!currentLocation && Platform.OS !== 'web' && (
                 <View style={styles.mapNotice} pointerEvents="none">
                   <Text style={styles.mapNoticeText}>
@@ -1731,11 +1773,17 @@ export default function App() {
 
               {currentUser.role === 'admin' && emergencyAlertsForAdmins.length > 0 && (
                 <View style={styles.adminEmergencyPanel}>
-                  <Text style={styles.adminEmergencyTitle}>Alertes urgences participants</Text>
+                  <Text style={styles.adminEmergencyTitle}>Alertes urgences participants (appuie pour supprimer)</Text>
                   {emergencyAlertsForAdmins.map((alert) => (
-                    <Text key={alert.id} style={styles.adminEmergencyItem}>
-                      {alert.username} - {alert.eventName} ({new Date(alert.timestamp).toLocaleTimeString()})
-                    </Text>
+                    <Pressable
+                      key={alert.id}
+                      style={styles.adminEmergencyItemButton}
+                      onPress={() => handleDeleteEmergencyAlert(alert.id)}
+                    >
+                      <Text style={styles.adminEmergencyItem}>
+                        {alert.username} - {alert.eventName} ({new Date(alert.timestamp).toLocaleTimeString()})
+                      </Text>
+                    </Pressable>
                   ))}
                 </View>
               )}
@@ -2464,7 +2512,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     left: 12,
     right: 12,
-    bottom: 118,
+    bottom: 148,
     backgroundColor: 'rgba(255, 255, 255, 0.97)',
     borderRadius: 12,
     padding: 10,
@@ -2594,10 +2642,30 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 13,
   },
+  adminEmergencyItemButton: {
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    backgroundColor: 'rgba(239, 68, 68, 0.22)',
+  },
   adminEmergencyItem: {
     color: '#ffffff',
     fontSize: 12,
     fontWeight: '600',
+  },
+  recenterButton: {
+    position: 'absolute',
+    right: 16,
+    bottom: 28,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: 'rgba(15, 118, 110, 0.95)',
+  },
+  recenterButtonText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
   },
   focusContainer: {
     flex: 1,
