@@ -1,4 +1,3 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
@@ -78,10 +77,6 @@ type EmergencyAlert = {
   timestamp: number;
 };
 
-const STORAGE_KEY = 'les-sources-users-v1';
-const STORAGE_LOCATIONS_KEY = 'les-sources-locations-v1';
-const STORAGE_EVENTS_KEY = 'les-sources-events-v1';
-const STORAGE_EMERGENCY_ALERTS_KEY = 'les-sources-emergency-alerts-v1';
 const CLOUD_USERS_PATH = 'users';
 const CLOUD_LOCATIONS_PATH = 'locations';
 const CLOUD_EVENTS_PATH = 'events';
@@ -368,10 +363,7 @@ export default function App() {
 
   useEffect(() => {
     if (!useCloudSync) {
-      loadUsers();
-      loadUserLocations();
-      loadEvents();
-      loadEmergencyAlerts();
+      setIsReady(true);
       return;
     }
 
@@ -444,102 +436,40 @@ export default function App() {
     });
   }, [users]);
 
-  const loadUsers = async () => {
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
-      if (!raw) {
-        setUsers(DEFAULT_USERS);
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_USERS));
-      } else {
-        const parsed: User[] = JSON.parse(raw);
-        const hasAdmin = parsed.some((u: User) => u.username === 'admin' && u.role === 'admin');
-        const nextUsers = hasAdmin ? parsed : [...parsed, ...DEFAULT_USERS];
-        setUsers(nextUsers);
-        if (!hasAdmin) {
-          await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(nextUsers));
-        }
-      }
-    } catch {
-      setUsers(DEFAULT_USERS);
-    } finally {
-      setIsReady(true);
-    }
-  };
-
   const persistUsers = async (nextUsers: User[]) => {
     setUsers(nextUsers);
-    if (useCloudSync) {
-      await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
-      return;
+    if (!useCloudSync) {
+      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
     }
 
-    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(nextUsers));
-  };
-
-  const loadUserLocations = async () => {
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_LOCATIONS_KEY);
-      if (raw) {
-        const parsed: UserLocation[] = JSON.parse(raw);
-        setUserLocations(parsed);
-      }
-    } catch {
-      // Ignore errors
-    }
-  };
-
-  const loadEvents = async () => {
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_EVENTS_KEY);
-      if (raw) {
-        const parsed: EventItem[] = JSON.parse(raw);
-        setEvents(parsed);
-      }
-    } catch {
-      setEvents([]);
-    }
+    await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
   };
 
   const persistEvents = async (nextEvents: EventItem[]) => {
     setEvents(nextEvents);
-    if (useCloudSync) {
-      await writeCloudValue(CLOUD_EVENTS_PATH, mapById(nextEvents));
-      return;
+    if (!useCloudSync) {
+      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
     }
 
-    await AsyncStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(nextEvents));
-  };
-
-  const loadEmergencyAlerts = async () => {
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_EMERGENCY_ALERTS_KEY);
-      if (raw) {
-        const parsed: EmergencyAlert[] = JSON.parse(raw);
-        setEmergencyAlerts(parsed);
-      }
-    } catch {
-      setEmergencyAlerts([]);
-    }
+    await writeCloudValue(CLOUD_EVENTS_PATH, mapById(nextEvents));
   };
 
   const persistEmergencyAlerts = async (nextAlerts: EmergencyAlert[]) => {
     setEmergencyAlerts(nextAlerts);
-    if (useCloudSync) {
-      await writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(nextAlerts));
-      return;
+    if (!useCloudSync) {
+      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
     }
 
-    await AsyncStorage.setItem(STORAGE_EMERGENCY_ALERTS_KEY, JSON.stringify(nextAlerts));
+    await writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(nextAlerts));
   };
 
   const persistUserLocations = async (nextLocations: UserLocation[]) => {
     setUserLocations(nextLocations);
-    if (useCloudSync) {
-      await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations));
-      return;
+    if (!useCloudSync) {
+      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
     }
 
-    await AsyncStorage.setItem(STORAGE_LOCATIONS_KEY, JSON.stringify(nextLocations));
+    await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations));
   };
 
   const handlePickGpxFile = async () => {
@@ -1350,6 +1280,23 @@ export default function App() {
 
   const isParticipantNormalNavigation =
     currentUser?.role === 'participant' && activeEventId !== null && navigationMode === 'normal';
+
+  if (!useCloudSync) {
+    return (
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.screen}>
+          <StatusBar style="dark" />
+          <View style={styles.centered}>
+            <Text style={styles.title}>Configuration requise</Text>
+            <Text style={styles.subtitle}>
+              Pour que comptes, evenements et positions soient communs entre tous les appareils
+              (Android, iPhone, web), renseigne EXPO_PUBLIC_FIREBASE_DATABASE_URL ou expo.extra.databaseURL.
+            </Text>
+          </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
+    );
+  }
 
   if (!isReady) {
     return (

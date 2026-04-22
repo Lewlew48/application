@@ -11,22 +11,17 @@ Application mobile Expo (Android + iPhone) avec:
 
 La synchronisation entre appareils est active via **Firebase Realtime Database** en REST.
 
-- Si Firebase est configure, tous les telephones connectes partagent les memes donnees (comptes, positions, evenements, alertes).
-- Si Firebase n'est pas configure, l'application retombe en mode local (stockage AsyncStorage sur chaque appareil).
+- Cette version fonctionne en **mode cloud obligatoire**: comptes, positions, evenements et alertes sont communs entre Android, iPhone et web.
+- Si `databaseURL` n'est pas configure, l'application affiche un ecran de configuration requise.
 
 ### Configuration Firebase
 
 1. Creer un projet Firebase.
 2. Activer **Realtime Database** en mode test (puis regler les regles de securite).
-3. Recuperer les informations de configuration Web Firebase.
-4. Remplir le champ `databaseURL` dans `app.json`:
-  - `apiKey`
-  - `authDomain`
-  - `databaseURL`
-  - `projectId`
-  - `storageBucket`
-  - `messagingSenderId`
-  - `appId`
+3. Ouvrir Realtime Database et copier l'URL de base (exemple: `https://mon-projet-default-rtdb.europe-west1.firebasedatabase.app`).
+4. Renseigner cette URL dans `app.json`:
+  - `expo.extra.databaseURL`
+5. Alternative: definir `EXPO_PUBLIC_FIREBASE_DATABASE_URL` avec la meme valeur.
 
 ## Important: Snack Expo
 
@@ -96,8 +91,8 @@ Dans les deux cas:
 
 ## Fonctionnement
 
-- La connexion verifie les identifiants partages via Firebase REST si configure (sinon local).
-- Les comptes utilisateurs, positions, evenements et alertes sont synchronises en temps réel via Firebase REST si configure.
+- La connexion verifie les identifiants partages via Firebase REST.
+- Les comptes utilisateurs, positions, evenements et alertes sont synchronises en temps réel via Firebase REST.
 - Le compte `admin` ne peut pas etre supprime.
 - **Page Carte**:
   - Affichage d'une vraie carte en vue satellite
