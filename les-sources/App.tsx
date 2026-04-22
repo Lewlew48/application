@@ -12,13 +12,13 @@ import {
   Linking,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import MapView, { Marker, Polyline } from 'react-native-maps';
 
 type Role = 'admin' | 'benevole' | 'participant';
@@ -1178,7 +1178,7 @@ export default function App() {
   );
 
   const isParticipantNormalNavigation =
-    currentUser.role === 'participant' && activeEventId !== null && navigationMode === 'normal';
+    currentUser?.role === 'participant' && activeEventId !== null && navigationMode === 'normal';
 
   if (!isReady) {
     return (
@@ -1228,7 +1228,8 @@ export default function App() {
   }
 
   return (
-    <SafeAreaView style={styles.screen}>
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.screen}>
       <StatusBar style="dark" />
       {!isParticipantNavigationActive && (
         <View style={styles.panelHeader}>
@@ -1378,19 +1379,20 @@ export default function App() {
                       description={currentUser.username}
                       anchor={{ x: 0.5, y: 0.5 }}
                       flat
+                      tracksViewChanges
                     >
-                      <View
-                        style={[
-                          styles.participantArrowContainer,
-                          { transform: [{ rotate: `${normalizeDegrees(currentHeading)}deg` }] },
-                        ]}
-                      >
-                        <View
+                      <View style={styles.participantArrowContainer}>
+                        <Text
                           style={[
-                            styles.participantArrow,
-                            { borderBottomColor: '#2563eb' },
+                            styles.participantArrowGlyph,
+                            {
+                              color: '#2563eb',
+                              transform: [{ rotate: `${normalizeDegrees(currentHeading)}deg` }],
+                            },
                           ]}
-                        />
+                        >
+                          ▲
+                        </Text>
                       </View>
                     </Marker>
                   ) : (
@@ -1427,23 +1429,20 @@ export default function App() {
                         description="Participant"
                         anchor={{ x: 0.5, y: 0.5 }}
                         flat
+                        tracksViewChanges
                       >
-                        <View
-                          style={[
-                            styles.participantArrowContainer,
-                            {
-                              transform: [
-                                { rotate: `${normalizeDegrees(location.heading ?? 0)}deg` },
-                              ],
-                            },
-                          ]}
-                        >
-                          <View
+                        <View style={styles.participantArrowContainer}>
+                          <Text
                             style={[
-                              styles.participantArrow,
-                              { borderBottomColor: '#dc2626' },
+                              styles.participantArrowGlyph,
+                              {
+                                color: '#dc2626',
+                                transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
+                              },
                             ]}
-                          />
+                          >
+                            ▲
+                          </Text>
                         </View>
                       </Marker>
                     );
@@ -1872,7 +1871,8 @@ export default function App() {
           onChange={handleEventPickerChange}
         />
       )}
-    </SafeAreaView>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -2343,14 +2343,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  participantArrow: {
-    width: 0,
-    height: 0,
-    borderLeftWidth: 8,
-    borderRightWidth: 8,
-    borderBottomWidth: 18,
-    borderLeftColor: 'transparent',
-    borderRightColor: 'transparent',
+  participantArrowGlyph: {
+    fontSize: 28,
+    fontWeight: '900',
+    lineHeight: 28,
   },
   navigationMetricsCard: {
     borderRadius: 10,
