@@ -1353,48 +1353,52 @@ export default function App() {
 
   if (!isReady) {
     return (
-      <SafeAreaView style={styles.screen}>
-        <StatusBar style="dark" />
-        <View style={styles.centered}>
-          <Text style={styles.title}>Chargement...</Text>
-        </View>
-      </SafeAreaView>
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.screen}>
+          <StatusBar style="dark" />
+          <View style={styles.centered}>
+            <Text style={styles.title}>Chargement...</Text>
+          </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
     );
   }
 
   if (!currentUser) {
     return (
-      <SafeAreaView style={styles.screen}>
-        <StatusBar style="dark" />
-        <KeyboardAvoidingView
-          style={styles.flex1}
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        >
-          <View style={styles.authContainer}>
-            <Text style={styles.appName}>Les Sources</Text>
-            <Text style={styles.subtitle}>Connexion</Text>
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.screen}>
+          <StatusBar style="dark" />
+          <KeyboardAvoidingView
+            style={styles.flex1}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <View style={styles.authContainer}>
+              <Text style={styles.appName}>Les Sources</Text>
+              <Text style={styles.subtitle}>Connexion</Text>
 
-            <TextInput
-              style={styles.input}
-              placeholder="Nom d utilisateur"
-              value={loginUsername}
-              onChangeText={setLoginUsername}
-              autoCapitalize="none"
-            />
-            <TextInput
-              style={styles.input}
-              placeholder="Mot de passe"
-              value={loginPassword}
-              onChangeText={setLoginPassword}
-              secureTextEntry
-            />
+              <TextInput
+                style={styles.input}
+                placeholder="Nom d utilisateur"
+                value={loginUsername}
+                onChangeText={setLoginUsername}
+                autoCapitalize="none"
+              />
+              <TextInput
+                style={styles.input}
+                placeholder="Mot de passe"
+                value={loginPassword}
+                onChangeText={setLoginPassword}
+                secureTextEntry
+              />
 
-            <Pressable style={styles.button} onPress={handleLogin}>
-              <Text style={styles.buttonText}>Se connecter</Text>
-            </Pressable>
-          </View>
-        </KeyboardAvoidingView>
-      </SafeAreaView>
+              <Pressable style={styles.button} onPress={handleLogin}>
+                <Text style={styles.buttonText}>Se connecter</Text>
+              </Pressable>
+            </View>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </SafeAreaProvider>
     );
   }
 
