@@ -972,16 +972,21 @@ export default function App() {
           }
 
           if (navigationModeRef.current === 'normal' && mapRef.current) {
-            const zoom = distanceToTarget < 35 ? 18 : 16;
-            mapRef.current.animateCamera(
-              {
-                center: updatedLocation,
-                heading: normalizeDegrees(currentHeadingRef.current),
-                pitch: 45,
-                zoom,
-              },
-              { duration: 600 }
-            );
+            const fromIndex = Math.min(nextWaypointIndexRef.current, currentEventPoints.length - 1);
+            const nextPoints = currentEventPoints.slice(fromIndex, Math.min(fromIndex + 7, currentEventPoints.length));
+            const pointsToFit = [updatedLocation, ...nextPoints];
+
+            if (pointsToFit.length >= 2) {
+              mapRef.current.fitToCoordinates(pointsToFit, {
+                edgePadding: {
+                  top: 90,
+                  right: 70,
+                  bottom: 190,
+                  left: 70,
+                },
+                animated: true,
+              });
+            }
           }
         }
       );
@@ -1202,34 +1207,36 @@ export default function App() {
       )}
 
       {/* Navigation tabs */}
-      <View style={styles.navTabs}>
-        <Pressable
-          style={[styles.navTab, currentPage === 'carte' && styles.navTabActive]}
-          onPress={() => setCurrentPage('carte')}
-        >
-          <Text style={[styles.navTabText, currentPage === 'carte' && styles.navTabTextActive]}>
-            Carte
-          </Text>
-        </Pressable>
-        <Pressable
-          style={[styles.navTab, currentPage === 'compte' && styles.navTabActive]}
-          onPress={() => setCurrentPage('compte')}
-        >
-          <Text style={[styles.navTabText, currentPage === 'compte' && styles.navTabTextActive]}>
-            Mon Compte
-          </Text>
-        </Pressable>
-        {currentUser.role === 'admin' && (
+      {!isParticipantNavigationActive && (
+        <View style={styles.navTabs}>
           <Pressable
-            style={[styles.navTab, currentPage === 'admin' && styles.navTabActive]}
-            onPress={() => setCurrentPage('admin')}
+            style={[styles.navTab, currentPage === 'carte' && styles.navTabActive]}
+            onPress={() => setCurrentPage('carte')}
           >
-            <Text style={[styles.navTabText, currentPage === 'admin' && styles.navTabTextActive]}>
-              Admin
+            <Text style={[styles.navTabText, currentPage === 'carte' && styles.navTabTextActive]}>
+              Carte
             </Text>
           </Pressable>
-        )}
-      </View>
+          <Pressable
+            style={[styles.navTab, currentPage === 'compte' && styles.navTabActive]}
+            onPress={() => setCurrentPage('compte')}
+          >
+            <Text style={[styles.navTabText, currentPage === 'compte' && styles.navTabTextActive]}>
+              Mon Compte
+            </Text>
+          </Pressable>
+          {currentUser.role === 'admin' && (
+            <Pressable
+              style={[styles.navTab, currentPage === 'admin' && styles.navTabActive]}
+              onPress={() => setCurrentPage('admin')}
+            >
+              <Text style={[styles.navTabText, currentPage === 'admin' && styles.navTabTextActive]}>
+                Admin
+              </Text>
+            </Pressable>
+          )}
+        </View>
+      )}
 
       {/* Content pages */}
       {currentPage === 'carte' ? (
@@ -1393,7 +1400,7 @@ export default function App() {
               )}
 
               {currentUser.role === 'participant' && (
-                <View style={styles.participantPanel}>
+                <View style={[styles.participantPanel, activeEventId && styles.participantPanelActive]}>
                   {!activeEventId ? (
                     <>
                       <Text style={styles.participantPanelTitle}>Sélection de l'évènement</Text>
@@ -2186,13 +2193,18 @@ const styles = StyleSheet.create({
     position: 'absolute',
     left: 12,
     right: 12,
-    bottom: 130,
+    bottom: 118,
     backgroundColor: 'rgba(255, 255, 255, 0.97)',
     borderRadius: 12,
-    padding: 12,
-    gap: 10,
+    padding: 10,
+    gap: 8,
     borderWidth: 1,
     borderColor: '#d9e2ec',
+  },
+  participantPanelActive: {
+    bottom: 8,
+    paddingVertical: 8,
+    gap: 6,
   },
   participantPanelTitle: {
     fontSize: 15,
