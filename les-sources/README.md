@@ -9,7 +9,7 @@ Application mobile Expo (Android + iPhone) avec:
 
 ## Synchronisation multi-appareils (iPhone + Android)
 
-La synchronisation entre appareils est active via **Firebase Realtime Database**.
+La synchronisation entre appareils est active via **Firebase Realtime Database** en REST.
 
 - Si Firebase est configure, tous les telephones connectes partagent les memes donnees (comptes, positions, evenements, alertes).
 - Si Firebase n'est pas configure, l'application retombe en mode local (stockage AsyncStorage sur chaque appareil).
@@ -19,7 +19,7 @@ La synchronisation entre appareils est active via **Firebase Realtime Database**
 1. Creer un projet Firebase.
 2. Activer **Realtime Database** en mode test (puis regler les regles de securite).
 3. Recuperer les informations de configuration Web Firebase.
-4. Remplir les champs `expo.extra` dans `app.json`:
+4. Remplir le champ `databaseURL` dans `app.json`:
   - `apiKey`
   - `authDomain`
   - `databaseURL`
@@ -55,7 +55,6 @@ L'application supporte 3 rôles:
 3. Copier le contenu de App.tsx de ce projet dans le fichier App.js du Snack.
 4. Installer les dépendances depuis le panneau **Dependencies** du Snack:
    - `@react-native-async-storage/async-storage`
-  - `firebase`
   - `expo-document-picker` (pour choisir un fichier GPX depuis le téléphone)
    - `expo-location` (optionnel - pour la géolocalisation)
    - **Note:** `react-native-maps` n'est **pas supporté** sur Snack Expo
@@ -97,8 +96,8 @@ Dans les deux cas:
 
 ## Fonctionnement
 
-- La connexion verifie les identifiants partages via Firebase si configure (sinon local).
-- Les comptes utilisateurs, positions, evenements et alertes sont synchronises en temps reel via Firebase si configure.
+- La connexion verifie les identifiants partages via Firebase REST si configure (sinon local).
+- Les comptes utilisateurs, positions, evenements et alertes sont synchronises en temps réel via Firebase REST si configure.
 - Le compte `admin` ne peut pas etre supprime.
 - **Page Carte**:
   - Affichage d'une vraie carte en vue satellite

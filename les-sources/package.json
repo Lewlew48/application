@@ -10,14 +10,14 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "@react-native-community/datetimepicker": "8.4.4",
-    "react-native-safe-area-context": "^5.3.0",
-    "firebase": "^11.6.1",
     "expo-location": "~19.0.8",
     "expo-keep-awake": "~15.0.8",
     "expo-status-bar": "~3.0.9",
     "react-native-maps": "1.20.1",
     "expo-document-picker": "~14.0.8",
-    "@react-native-async-storage/async-storage": "2.2.0"
+    "react-native-safe-area-context": "~5.6.0",
+    "@react-native-community/datetimepicker": "8.4.4",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo-constants": "~18.0.13"
   }
 }

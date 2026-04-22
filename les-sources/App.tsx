@@ -4,7 +4,6 @@ import * as Location from 'expo-location';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { StatusBar } from 'expo-status-bar';
-import { onValue, ref as dbRef, remove, set } from 'firebase/database';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
@@ -21,7 +20,12 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import MapView, { Marker, Polyline } from 'react-native-maps';
-import { firebaseDatabase, isFirebaseEnabled } from './firebase';
+import {
+  cloudSyncEnabled,
+  deleteCloudValue,
+  readCloudValue,
+  writeCloudValue,
+} from './firebase';
 
 type Role = 'admin' | 'benevole' | 'participant';
 type Page = 'admin' | 'carte' | 'compte';
@@ -299,7 +303,7 @@ const isEventVisibleForUser = (event: EventItem, role: Role) => {
 };
 
 export default function App() {
-  const useCloudSync = Boolean(firebaseDatabase && isFirebaseEnabled);
+  const useCloudSync = cloudSyncEnabled;
   const [users, setUsers] = useState<User[]>([]);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isReady, setIsReady] = useState(false);
@@ -354,7 +358,7 @@ export default function App() {
   const [accountPassword, setAccountPassword] = useState('');
 
   useEffect(() => {
-    if (!useCloudSync || !firebaseDatabase) {
+    if (!useCloudSync) {
       loadUsers();
       loadUserLocations();
       loadEvents();
@@ -362,47 +366,52 @@ export default function App() {
       return;
     }
 
-    const unsubscribeUsers = onValue(dbRef(firebaseDatabase, CLOUD_USERS_PATH), async (snapshot) => {
-      const parsedUsers = valuesFromRecord<User>(snapshot.val());
+    let isMounted = true;
 
-      if (parsedUsers.length === 0) {
-        await set(dbRef(firebaseDatabase, CLOUD_USERS_PATH), mapById(DEFAULT_USERS));
-        setUsers(DEFAULT_USERS);
-        setIsReady(true);
-        return;
+    const syncFromCloud = async () => {
+      try {
+        const [cloudUsers, cloudLocations, cloudEvents, cloudAlerts] = await Promise.all([
+          readCloudValue<Record<string, User>>(CLOUD_USERS_PATH),
+          readCloudValue<Record<string, UserLocation>>(CLOUD_LOCATIONS_PATH),
+          readCloudValue<Record<string, EventItem>>(CLOUD_EVENTS_PATH),
+          readCloudValue<Record<string, EmergencyAlert>>(CLOUD_EMERGENCY_ALERTS_PATH),
+        ]);
+
+        if (!isMounted) {
+          return;
+        }
+
+        const parsedUsers = valuesFromRecord<User>(cloudUsers);
+        const hasAdmin = parsedUsers.some((user: User) => user.username === 'admin' && user.role === 'admin');
+        const nextUsers = parsedUsers.length === 0 ? DEFAULT_USERS : hasAdmin ? parsedUsers : [...parsedUsers, ...DEFAULT_USERS];
+
+        if (parsedUsers.length === 0 || !hasAdmin) {
+          await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
+        }
+
+        setUsers(nextUsers);
+        setUserLocations(valuesFromRecord<UserLocation>(cloudLocations));
+        setEvents(valuesFromRecord<EventItem>(cloudEvents));
+        setEmergencyAlerts(
+          valuesFromRecord<EmergencyAlert>(cloudAlerts)
+            .sort((left, right) => right.timestamp - left.timestamp)
+            .slice(0, 50)
+        );
+      } catch {
+        // Ignore cloud sync errors and keep the last good state.
+      } finally {
+        if (isMounted) {
+          setIsReady(true);
+        }
       }
+    };
 
-      const hasAdmin = parsedUsers.some((user: User) => user.username === 'admin' && user.role === 'admin');
-      const nextUsers = hasAdmin ? parsedUsers : [...parsedUsers, ...DEFAULT_USERS];
-
-      if (!hasAdmin) {
-        await set(dbRef(firebaseDatabase, CLOUD_USERS_PATH), mapById(nextUsers));
-      }
-
-      setUsers(nextUsers);
-      setIsReady(true);
-    });
-
-    const unsubscribeLocations = onValue(dbRef(firebaseDatabase, CLOUD_LOCATIONS_PATH), (snapshot) => {
-      setUserLocations(valuesFromRecord<UserLocation>(snapshot.val()));
-    });
-
-    const unsubscribeEvents = onValue(dbRef(firebaseDatabase, CLOUD_EVENTS_PATH), (snapshot) => {
-      setEvents(valuesFromRecord<EventItem>(snapshot.val()));
-    });
-
-    const unsubscribeAlerts = onValue(dbRef(firebaseDatabase, CLOUD_EMERGENCY_ALERTS_PATH), (snapshot) => {
-      const nextAlerts = valuesFromRecord<EmergencyAlert>(snapshot.val())
-        .sort((left, right) => right.timestamp - left.timestamp)
-        .slice(0, 50);
-      setEmergencyAlerts(nextAlerts);
-    });
+    syncFromCloud();
+    const syncInterval = setInterval(syncFromCloud, 2000);
 
     return () => {
-      unsubscribeUsers();
-      unsubscribeLocations();
-      unsubscribeEvents();
-      unsubscribeAlerts();
+      isMounted = false;
+      clearInterval(syncInterval);
     };
   }, [useCloudSync]);
 
@@ -450,8 +459,8 @@ export default function App() {
 
   const persistUsers = async (nextUsers: User[]) => {
     setUsers(nextUsers);
-    if (useCloudSync && firebaseDatabase) {
-      await set(dbRef(firebaseDatabase, CLOUD_USERS_PATH), mapById(nextUsers));
+    if (useCloudSync) {
+      await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
       return;
     }
 
@@ -484,8 +493,8 @@ export default function App() {
 
   const persistEvents = async (nextEvents: EventItem[]) => {
     setEvents(nextEvents);
-    if (useCloudSync && firebaseDatabase) {
-      await set(dbRef(firebaseDatabase, CLOUD_EVENTS_PATH), mapById(nextEvents));
+    if (useCloudSync) {
+      await writeCloudValue(CLOUD_EVENTS_PATH, mapById(nextEvents));
       return;
     }
 
@@ -506,8 +515,8 @@ export default function App() {
 
   const persistEmergencyAlerts = async (nextAlerts: EmergencyAlert[]) => {
     setEmergencyAlerts(nextAlerts);
-    if (useCloudSync && firebaseDatabase) {
-      await set(dbRef(firebaseDatabase, CLOUD_EMERGENCY_ALERTS_PATH), mapById(nextAlerts));
+    if (useCloudSync) {
+      await writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(nextAlerts));
       return;
     }
 
@@ -516,8 +525,8 @@ export default function App() {
 
   const persistUserLocations = async (nextLocations: UserLocation[]) => {
     setUserLocations(nextLocations);
-    if (useCloudSync && firebaseDatabase) {
-      await set(dbRef(firebaseDatabase, CLOUD_LOCATIONS_PATH), mapLocationsByUserId(nextLocations));
+    if (useCloudSync) {
+      await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations));
       return;
     }
 
@@ -826,8 +835,8 @@ export default function App() {
     const nextLocations = userLocations.filter((loc: UserLocation) => loc.userId !== userId);
     await persistUserLocations(nextLocations);
 
-    if (useCloudSync && firebaseDatabase) {
-      await remove(dbRef(firebaseDatabase, `${CLOUD_LOCATIONS_PATH}/${userId}`));
+    if (useCloudSync) {
+      await deleteCloudValue(`${CLOUD_LOCATIONS_PATH}/${userId}`);
     }
 
     if (currentUser?.id === userId) {
