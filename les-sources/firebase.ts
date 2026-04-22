@@ -6,11 +6,36 @@ type FirebaseConfig = {
 
 type FirebaseExtra = Partial<FirebaseConfig>;
 
-const extraConfig = (Constants.expoConfig?.extra ?? {}) as FirebaseExtra;
+type ConstantsWithLegacyManifest = typeof Constants & {
+  manifest?: {
+    extra?: FirebaseExtra;
+  };
+  manifest2?: {
+    extra?: {
+      expoClient?: {
+        extra?: FirebaseExtra;
+      };
+    };
+  };
+};
 
-const databaseUrl = process.env.EXPO_PUBLIC_FIREBASE_DATABASE_URL ?? extraConfig.databaseURL ?? '';
+const constantsWithLegacyManifest = Constants as ConstantsWithLegacyManifest;
+const extraFromExpoConfig = (Constants.expoConfig?.extra ?? {}) as FirebaseExtra;
+const extraFromManifest = (constantsWithLegacyManifest.manifest?.extra ?? {}) as FirebaseExtra;
+const extraFromManifest2 =
+  (constantsWithLegacyManifest.manifest2?.extra?.expoClient?.extra ?? {}) as FirebaseExtra;
 
-const normalizeDatabaseUrl = (value: string) => value.replace(/\/$/, '');
+const resolvedExtra: FirebaseExtra = {
+  ...extraFromManifest,
+  ...extraFromManifest2,
+  ...extraFromExpoConfig,
+};
+
+const databaseUrlRaw =
+  process.env.EXPO_PUBLIC_FIREBASE_DATABASE_URL ?? resolvedExtra.databaseURL ?? '';
+
+const normalizeDatabaseUrl = (value: string) => value.trim().replace(/\/+$/, '');
+const databaseUrl = normalizeDatabaseUrl(databaseUrlRaw);
 
 const buildDatabasePath = (path: string) => {
   const normalizedPath = path.replace(/^\/+|\/+$/g, '');
