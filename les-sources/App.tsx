@@ -1,7 +1,9 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 import * as Location from 'expo-location';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   FlatList,
@@ -15,7 +17,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import MapView, { Marker } from 'react-native-maps';
+import MapView, { Marker, Polyline } from 'react-native-maps';
 
 type Role = 'admin' | 'benevole' | 'participant';
 type Page = 'admin' | 'carte';
@@ -35,8 +37,30 @@ type UserLocation = {
   timestamp: number;
 };
 
+type EventTrackPoint = {
+  latitude: number;
+  longitude: number;
+};
+
+type EventItem = {
+  id: string;
+  name: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  gpxText: string;
+  showForVolunteers: boolean;
+};
+
+type VisibleEvent = {
+  event: EventItem;
+  index: number;
+  points: EventTrackPoint[];
+};
+
 const STORAGE_KEY = 'les-sources-users-v1';
 const STORAGE_LOCATIONS_KEY = 'les-sources-locations-v1';
+const STORAGE_EVENTS_KEY = 'les-sources-events-v1';
 
 const DEFAULT_USERS: User[] = [
   {
@@ -46,6 +70,51 @@ const DEFAULT_USERS: User[] = [
     role: 'admin',
   },
 ];
+
+const DEFAULT_MAP_REGION = {
+  latitude: 48.8566,
+  longitude: 2.3522,
+  latitudeDelta: 0.0922,
+  longitudeDelta: 0.0421,
+};
+
+const EVENT_COLORS = ['#ef4444', '#2563eb', '#f59e0b', '#10b981', '#8b5cf6'];
+
+const getLocalDateKey = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const isValidDateInput = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value);
+
+const isValidTimeInput = (value: string) => /^\d{2}:\d{2}$/.test(value);
+
+const parseGpxTrackPoints = (gpxText: string): EventTrackPoint[] => {
+  const points: EventTrackPoint[] = [];
+  const trackPointPattern = /<trkpt\b[^>]*\blat="([^"]+)"[^>]*\blon="([^"]+)"[^>]*>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = trackPointPattern.exec(gpxText)) !== null) {
+    const latitude = Number.parseFloat(match[1]);
+    const longitude = Number.parseFloat(match[2]);
+
+    if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+      points.push({ latitude, longitude });
+    }
+  }
+
+  return points;
+};
+
+const isEventVisibleForUser = (event: EventItem, role: Role) => {
+  if (event.showForVolunteers) {
+    return role === 'admin' || role === 'benevole';
+  }
+
+  return event.date === getLocalDateKey(new Date());
+};
 
 export default function App() {
   const [users, setUsers] = useState<User[]>([]);
@@ -62,10 +131,20 @@ export default function App() {
 
   const [userLocations, setUserLocations] = useState<UserLocation[]>([]);
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [events, setEvents] = useState<EventItem[]>([]);
+
+  const [eventName, setEventName] = useState('');
+  const [eventDate, setEventDate] = useState('');
+  const [eventStartTime, setEventStartTime] = useState('');
+  const [eventEndTime, setEventEndTime] = useState('');
+  const [eventGpxText, setEventGpxText] = useState('');
+  const [eventGpxFileName, setEventGpxFileName] = useState('');
+  const [eventVisibleForVolunteers, setEventVisibleForVolunteers] = useState(false);
 
   useEffect(() => {
     loadUsers();
     loadUserLocations();
+    loadEvents();
   }, []);
 
   const sortedUsers = useMemo(() => {
@@ -85,7 +164,7 @@ export default function App() {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_USERS));
       } else {
         const parsed: User[] = JSON.parse(raw);
-        const hasAdmin = parsed.some((u) => u.username === 'admin' && u.role === 'admin');
+        const hasAdmin = parsed.some((u: User) => u.username === 'admin' && u.role === 'admin');
         const nextUsers = hasAdmin ? parsed : [...parsed, ...DEFAULT_USERS];
         setUsers(nextUsers);
         if (!hasAdmin) {
@@ -116,13 +195,61 @@ export default function App() {
     }
   };
 
+  const loadEvents = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(STORAGE_EVENTS_KEY);
+      if (raw) {
+        const parsed: EventItem[] = JSON.parse(raw);
+        setEvents(parsed);
+      }
+    } catch {
+      setEvents([]);
+    }
+  };
+
+  const persistEvents = async (nextEvents: EventItem[]) => {
+    setEvents(nextEvents);
+    await AsyncStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(nextEvents));
+  };
+
+  const handlePickGpxFile = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['application/gpx+xml', 'application/xml', 'text/xml', 'text/plain'],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+
+      const assets = result.assets ?? [];
+      if (result.canceled || assets.length === 0) {
+        return;
+      }
+
+      const asset = assets[0];
+      const fileName = asset.name ?? 'fichier.gpx';
+      if (!fileName.toLowerCase().endsWith('.gpx')) {
+        Alert.alert('Erreur', 'Choisis un fichier .gpx.');
+        return;
+      }
+
+      const gpxText = await FileSystem.readAsStringAsync(asset.uri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      setEventGpxText(gpxText);
+      setEventGpxFileName(fileName);
+    } catch {
+      Alert.alert('Erreur', 'Impossible de lire le fichier GPX.');
+    }
+  };
+
   const updateUserLocation = async (
     userId: string,
     username: string,
     latitude: number,
     longitude: number
   ) => {
-    const existingIndex = userLocations.findIndex((loc) => loc.userId === userId);
+    const existingIndex = userLocations.findIndex((loc: UserLocation) => loc.userId === userId);
     const newLocation: UserLocation = {
       userId,
       username,
@@ -205,11 +332,60 @@ export default function App() {
     return '#0f766e'; // Vert pour admin
   };
 
+  const handleCreateEvent = async () => {
+    const name = eventName.trim();
+    const date = eventDate.trim();
+    const startTime = eventStartTime.trim();
+    const endTime = eventEndTime.trim();
+    const gpxText = eventGpxText.trim();
+
+    if (!name || !date || !startTime || !endTime || !gpxText) {
+      Alert.alert('Erreur', 'Tous les champs de l evenement sont obligatoires.');
+      return;
+    }
+
+    if (!isValidDateInput(date)) {
+      Alert.alert('Erreur', 'La date doit etre au format YYYY-MM-DD.');
+      return;
+    }
+
+    if (!isValidTimeInput(startTime) || !isValidTimeInput(endTime)) {
+      Alert.alert('Erreur', 'Les heures doivent etre au format HH:MM.');
+      return;
+    }
+
+    const parsedTrack = parseGpxTrackPoints(gpxText);
+    if (parsedTrack.length < 2) {
+      Alert.alert('Erreur', 'Le GPX doit contenir au moins deux points de trace valides.');
+      return;
+    }
+
+    const nextEvent: EventItem = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      date,
+      startTime,
+      endTime,
+      gpxText,
+      showForVolunteers: eventVisibleForVolunteers,
+    };
+
+    const nextEvents = [...events, nextEvent];
+    await persistEvents(nextEvents);
+    setEventName('');
+    setEventDate('');
+    setEventStartTime('');
+    setEventEndTime('');
+    setEventGpxText('');
+    setEventGpxFileName('');
+    setEventVisibleForVolunteers(false);
+  };
+
   const handleLogin = () => {
     const username = loginUsername.trim();
     const password = loginPassword.trim();
 
-    const found = users.find((u) => u.username === username && u.password === password);
+    const found = users.find((u: User) => u.username === username && u.password === password);
     if (!found) {
       Alert.alert('Connexion echouee', 'Identifiants invalides.');
       return;
@@ -221,7 +397,6 @@ export default function App() {
     
     // Commencer à tracker la position GPS réelle
     startLocationTracking();
-  };
   };
 
   const handleLogout = () => {
@@ -241,7 +416,7 @@ export default function App() {
       return;
     }
 
-    if (users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
+    if (users.some((u: User) => u.username.toLowerCase() === username.toLowerCase())) {
       Alert.alert('Erreur', 'Ce nom d utilisateur existe deja.');
       return;
     }
@@ -261,7 +436,7 @@ export default function App() {
   };
 
   const handleDeleteUser = async (userId: string) => {
-    const target = users.find((u) => u.id === userId);
+    const target = users.find((u: User) => u.id === userId);
     if (!target) {
       return;
     }
@@ -271,13 +446,42 @@ export default function App() {
       return;
     }
 
-    const nextUsers = users.filter((u) => u.id !== userId);
+    const nextUsers = users.filter((u: User) => u.id !== userId);
     await persistUsers(nextUsers);
 
     if (currentUser?.id === userId) {
       handleLogout();
     }
   };
+
+  const visibleEvents: VisibleEvent[] = useMemo(() => {
+    if (!currentUser) {
+      return [];
+    }
+
+    const nextVisibleEvents: VisibleEvent[] = [];
+
+    events.forEach((event: EventItem) => {
+      const points = parseGpxTrackPoints(event.gpxText);
+      if (points.length >= 2 && isEventVisibleForUser(event, currentUser.role)) {
+        nextVisibleEvents.push({
+          event,
+          index: nextVisibleEvents.length,
+          points,
+        });
+      }
+    });
+
+    return nextVisibleEvents;
+  }, [currentUser, events]);
+
+  const sortedEvents = useMemo(() => {
+    return [...events].sort((left, right) => {
+      const leftStamp = `${left.date} ${left.startTime}`;
+      const rightStamp = `${right.date} ${right.startTime}`;
+      return leftStamp.localeCompare(rightStamp);
+    });
+  }, [events]);
 
   if (!isReady) {
     return (
@@ -364,18 +568,18 @@ export default function App() {
       {/* Content pages */}
       {currentPage === 'carte' ? (
         <View style={styles.carteContainer}>
-          {currentLocation ? (
-            <MapView
-              style={styles.map}
-              initialRegion={{
-                latitude: currentLocation.latitude,
-                longitude: currentLocation.longitude,
-                latitudeDelta: 0.0922,
-                longitudeDelta: 0.0421,
-              }}
-              mapType="satellite"
-            >
-              {/* Marqueur pour l'utilisateur courant */}
+          <MapView
+            key={currentLocation ? `${currentLocation.latitude}-${currentLocation.longitude}` : 'default-map'}
+            style={styles.map}
+            initialRegion={currentLocation ? {
+              latitude: currentLocation.latitude,
+              longitude: currentLocation.longitude,
+              latitudeDelta: 0.0922,
+              longitudeDelta: 0.0421,
+            } : DEFAULT_MAP_REGION}
+            mapType="satellite"
+          >
+            {currentLocation && (
               <Marker
                 coordinate={{
                   latitude: currentLocation.latitude,
@@ -385,31 +589,54 @@ export default function App() {
                 description={currentUser.username}
                 pinColor={getMarkerColorByRole(currentUser.role)}
               />
+            )}
 
-              {/* Marqueurs pour les autres utilisateurs */}
-              {userLocations.map((location) => {
-                if (location.userId === currentUser.id) return null;
-                const user = users.find((u) => u.id === location.userId);
-                if (!user) return null;
+            {userLocations.map((location: UserLocation) => {
+              if (location.userId === currentUser.id) return null;
+              const user = users.find((u: User) => u.id === location.userId);
+              if (!user) return null;
 
-                return (
+              return (
+                <Marker
+                  key={location.userId}
+                  coordinate={{
+                    latitude: location.latitude,
+                    longitude: location.longitude,
+                  }}
+                  title={location.username}
+                  description={`Role: ${user.role}`}
+                  pinColor={getMarkerColorByRole(user.role)}
+                />
+              );
+            })}
+
+            {visibleEvents.map((visibleEvent: VisibleEvent) => {
+              const { event, index, points } = visibleEvent;
+              const color = EVENT_COLORS[index % EVENT_COLORS.length];
+
+              return (
+                <Fragment key={event.id}>
+                  <Polyline coordinates={points} strokeColor={color} strokeWidth={4} />
                   <Marker
-                    key={location.userId}
-                    coordinate={{
-                      latitude: location.latitude,
-                      longitude: location.longitude,
-                    }}
-                    title={location.username}
-                    description={`Role: ${user.role}`}
-                    pinColor={getMarkerColorByRole(user.role)}
+                    coordinate={points[0]}
+                    title={event.name}
+                    description={`${event.date} ${event.startTime} - ${event.endTime}`}
+                    pinColor={color}
                   />
-                );
-              })}
-            </MapView>
-          ) : (
-            <View style={styles.mapPlaceholder}>
-              <Text style={styles.mapPlaceholderText}>
-                Activation de la géolocalisation...
+                  <Marker
+                    coordinate={points[points.length - 1]}
+                    title={`${event.name} - fin`}
+                    pinColor={color}
+                  />
+                </Fragment>
+              );
+            })}
+          </MapView>
+
+          {!currentLocation && (
+            <View style={styles.mapNotice} pointerEvents="none">
+              <Text style={styles.mapNoticeText}>
+                Position GPS indisponible. La carte affiche quand meme les evenements.
               </Text>
             </View>
           )}
@@ -428,11 +655,104 @@ export default function App() {
               <View style={[styles.legendColor, { backgroundColor: '#0f766e' }]} />
               <Text style={styles.legendText}>Admin</Text>
             </View>
+            <View style={styles.legendItem}>
+              <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
+              <Text style={styles.legendText}>Evenement GPX</Text>
+            </View>
           </View>
         </View>
       ) : (
         <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
           <View style={styles.adminContainer}>
+            <Text style={styles.sectionTitle}>Creer un evenement</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Nom de l evenement"
+              value={eventName}
+              onChangeText={setEventName}
+            />
+            <View style={styles.fieldRow}>
+              <TextInput
+                style={[styles.input, styles.halfInput]}
+                placeholder="Date YYYY-MM-DD"
+                value={eventDate}
+                onChangeText={setEventDate}
+                autoCapitalize="none"
+              />
+              <TextInput
+                style={[styles.input, styles.halfInput]}
+                placeholder="Debut HH:MM"
+                value={eventStartTime}
+                onChangeText={setEventStartTime}
+                autoCapitalize="none"
+              />
+            </View>
+            <TextInput
+              style={styles.input}
+              placeholder="Fin HH:MM"
+              value={eventEndTime}
+              onChangeText={setEventEndTime}
+              autoCapitalize="none"
+            />
+            <View style={styles.checkboxRow}>
+              <Pressable
+                style={[styles.checkbox, eventVisibleForVolunteers && styles.checkboxActive]}
+                onPress={() => setEventVisibleForVolunteers((value) => !value)}
+              >
+                {eventVisibleForVolunteers ? <View style={styles.checkboxDot} /> : null}
+              </Pressable>
+              <Text style={styles.checkboxLabel}>Afficher pour bénévoles</Text>
+            </View>
+            <Pressable style={styles.secondaryActionButton} onPress={handlePickGpxFile}>
+              <Text style={styles.secondaryActionButtonText}>Sélectionner un fichier GPX</Text>
+            </Pressable>
+            <Text style={styles.helperText}>
+              {eventGpxFileName
+                ? `Fichier sélectionné: ${eventGpxFileName}`
+                : 'Aucun fichier sélectionné. Choisis un fichier .gpx.'}
+            </Text>
+            <View style={styles.gpxPreviewBox}>
+              <Text style={styles.gpxPreviewLabel}>GPX importé</Text>
+              <Text style={styles.gpxPreviewText} numberOfLines={4}>
+                {eventGpxText ? 'Contenu chargé et prêt à être enregistré.' : 'En attente de sélection.'}
+              </Text>
+            </View>
+
+            <Pressable style={styles.button} onPress={handleCreateEvent}>
+              <Text style={styles.buttonText}>Creer l evenement</Text>
+            </Pressable>
+
+            <Text style={styles.sectionTitle}>Evenements enregistres</Text>
+            {sortedEvents.length === 0 ? (
+              <Text style={styles.emptyText}>Aucun evenement pour le moment.</Text>
+            ) : (
+              <View style={styles.eventList}>
+                {sortedEvents.map((event) => {
+                  const trackPoints = parseGpxTrackPoints(event.gpxText);
+                  const visibilityLabel = event.showForVolunteers
+                    ? 'Bénévoles + admins'
+                    : 'Visible aujourd hui pour tous';
+
+                  return (
+                    <View key={event.id} style={styles.eventCard}>
+                      <View style={styles.eventCardHeader}>
+                        <View style={styles.eventCardTitleBlock}>
+                          <Text style={styles.eventCardTitle}>{event.name}</Text>
+                          <Text style={styles.eventCardMeta}>
+                            {event.date} de {event.startTime} a {event.endTime}
+                          </Text>
+                        </View>
+                        <View style={styles.eventBadge}>
+                          <Text style={styles.eventBadgeText}>{visibilityLabel}</Text>
+                        </View>
+                      </View>
+                      <Text style={styles.eventCardMeta}>{trackPoints.length} points GPX</Text>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+
             <Text style={styles.sectionTitle}>Creer un utilisateur</Text>
             <TextInput
               style={styles.input}
@@ -572,6 +892,20 @@ const styles = StyleSheet.create({
   },
   buttonText: {
     color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 16,
+  },
+  secondaryActionButton: {
+    backgroundColor: '#ffffff',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#9fb3c8',
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 2,
+  },
+  secondaryActionButtonText: {
+    color: '#334e68',
     fontWeight: '700',
     fontSize: 16,
   },
@@ -806,6 +1140,21 @@ const styles = StyleSheet.create({
   map: {
     flex: 1,
   },
+  mapNotice: {
+    position: 'absolute',
+    top: 16,
+    left: 16,
+    right: 16,
+    backgroundColor: 'rgba(16, 42, 67, 0.88)',
+    borderRadius: 10,
+    padding: 12,
+  },
+  mapNoticeText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
   mapPlaceholder: {
     flex: 1,
     alignItems: 'center',
@@ -845,5 +1194,116 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: '#102a43',
+  },
+  fieldRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  halfInput: {
+    flex: 1,
+  },
+  gpxInput: {
+    minHeight: 140,
+  },
+  gpxPreviewBox: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#d9e2ec',
+    backgroundColor: '#ffffff',
+    padding: 12,
+    gap: 6,
+    marginBottom: 8,
+  },
+  gpxPreviewLabel: {
+    fontSize: 12,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    color: '#9fb3c8',
+    fontWeight: '700',
+  },
+  gpxPreviewText: {
+    fontSize: 14,
+    color: '#334e68',
+    lineHeight: 20,
+  },
+  helperText: {
+    fontSize: 13,
+    color: '#627d98',
+    marginTop: 6,
+    marginBottom: 8,
+  },
+  checkboxRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 6,
+    marginBottom: 10,
+  },
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#9fb3c8',
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxActive: {
+    borderColor: '#0f766e',
+    backgroundColor: '#e6fffb',
+  },
+  checkboxDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#0f766e',
+  },
+  checkboxLabel: {
+    fontSize: 15,
+    color: '#334e68',
+    fontWeight: '600',
+  },
+  eventList: {
+    gap: 10,
+    marginBottom: 8,
+  },
+  eventCard: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#d9e2ec',
+    backgroundColor: '#ffffff',
+    padding: 12,
+    gap: 6,
+  },
+  eventCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  eventCardTitleBlock: {
+    flex: 1,
+  },
+  eventCardTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#102a43',
+  },
+  eventCardMeta: {
+    fontSize: 13,
+    color: '#627d98',
+    marginTop: 2,
+  },
+  eventBadge: {
+    backgroundColor: '#e6fffb',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  eventBadgeText: {
+    color: '#0f766e',
+    fontSize: 12,
+    fontWeight: '700',
   },
 });
