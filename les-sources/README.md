@@ -35,7 +35,6 @@ L'application supporte 3 rôles:
 4. Installer les dépendances depuis le panneau **Dependencies** du Snack:
    - `@react-native-async-storage/async-storage`
   - `expo-document-picker` (pour choisir un fichier GPX depuis le téléphone)
-  - `expo-file-system` (pour lire le contenu du fichier choisi)
    - `expo-location` (optionnel - pour la géolocalisation)
    - **Note:** `react-native-maps` n'est **pas supporté** sur Snack Expo
 5. Scanner le QR code du Snack avec Expo Go.

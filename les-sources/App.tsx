@@ -1,6 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
 import * as Location from 'expo-location';
 import { StatusBar } from 'expo-status-bar';
 import { Fragment, useEffect, useMemo, useState } from 'react';
@@ -231,9 +230,11 @@ export default function App() {
         return;
       }
 
-      const gpxText = await FileSystem.readAsStringAsync(asset.uri, {
-        encoding: FileSystem.EncodingType.UTF8,
-      });
+      const response = await fetch(asset.uri);
+      if (!response.ok) {
+        throw new Error('Impossible de lire le fichier GPX.');
+      }
+      const gpxText = await response.text();
 
       setEventGpxText(gpxText);
       setEventGpxFileName(fileName);
