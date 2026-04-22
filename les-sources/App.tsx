@@ -19,7 +19,6 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import MapView, { Marker, Polyline } from 'react-native-maps';
 import {
   cloudSyncEnabled,
   deleteCloudValue,
@@ -87,6 +86,16 @@ const CLOUD_USERS_PATH = 'users';
 const CLOUD_LOCATIONS_PATH = 'locations';
 const CLOUD_EVENTS_PATH = 'events';
 const CLOUD_EMERGENCY_ALERTS_PATH = 'emergencyAlerts';
+const MENDE_REGION = {
+  latitude: 44.5186,
+  longitude: 3.5017,
+};
+
+const mapsModule = Platform.OS === 'web' ? null : require('react-native-maps');
+const MapView = mapsModule?.default;
+const Marker = mapsModule?.Marker;
+const Polyline = mapsModule?.Polyline;
+const canRenderNativeMap = Boolean(MapView && Marker && Polyline);
 
 const DEFAULT_USERS: User[] = [
   {
@@ -346,7 +355,7 @@ export default function App() {
   const [emergencyAlerts, setEmergencyAlerts] = useState<EmergencyAlert[]>([]);
   const [emergencyCountdown, setEmergencyCountdown] = useState<number | null>(null);
 
-  const mapRef = useRef<MapView | null>(null);
+  const mapRef = useRef<any>(null);
   const previousNavigationPositionRef = useRef<{ latitude: number; longitude: number } | null>(null);
   const currentHeadingRef = useRef(0);
   const navigationModeRef = useRef<NavigationMode>('normal');
@@ -648,11 +657,11 @@ export default function App() {
     await persistUserLocations(updatedLocations);
   };
 
-  const generateMockLocation = () => {
-    // Génère une position GPS simulée proche de Paris
-    const baseLat = 48.8566;
-    const baseLng = 2.3522;
-    const offset = 0.01;
+  const generateMockLocation = (previousLocation?: { latitude: number; longitude: number } | null) => {
+    // Sur web/ordinateur, la position est simulée autour de Mende (48).
+    const baseLat = previousLocation?.latitude ?? MENDE_REGION.latitude;
+    const baseLng = previousLocation?.longitude ?? MENDE_REGION.longitude;
+    const offset = previousLocation ? 0.0015 : 0.01;
     return {
       latitude: baseLat + (Math.random() - 0.5) * offset,
       longitude: baseLng + (Math.random() - 0.5) * offset,
@@ -660,6 +669,10 @@ export default function App() {
   };
 
   const requestLocationPermission = async () => {
+    if (Platform.OS === 'web') {
+      return true;
+    }
+
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
@@ -677,6 +690,23 @@ export default function App() {
   };
 
   const startLocationTracking = async () => {
+    if (Platform.OS === 'web') {
+      const simulatedLocation = generateMockLocation(currentLocation);
+      setCurrentLocation(simulatedLocation);
+      setCurrentSpeedKmh(4 + Math.random() * 2);
+
+      if (currentUser) {
+        await updateUserLocation(
+          currentUser.id,
+          currentUser.username,
+          simulatedLocation.latitude,
+          simulatedLocation.longitude,
+          currentHeadingRef.current
+        );
+      }
+      return;
+    }
+
     const hasPermission = await requestLocationPermission();
     if (!hasPermission) return;
 
@@ -1049,11 +1079,35 @@ export default function App() {
 
     let locationSubscription: Location.LocationSubscription | null = null;
     let headingSubscription: Location.LocationSubscription | null = null;
+    let webSimulationTimer: ReturnType<typeof setInterval> | null = null;
     let isMounted = true;
 
     const startWatcher = async () => {
       const permission = await requestLocationPermission();
       if (!permission || !isMounted) {
+        return;
+      }
+
+      if (Platform.OS === 'web') {
+        let simulatedLocation = generateMockLocation(currentLocation);
+
+        webSimulationTimer = setInterval(async () => {
+          simulatedLocation = generateMockLocation(simulatedLocation);
+          const simulatedHeading = normalizeDegrees(currentHeadingRef.current + (Math.random() - 0.5) * 25);
+
+          setCurrentHeading(simulatedHeading);
+          setCurrentSpeedKmh(3 + Math.random() * 4);
+          setCurrentLocation(simulatedLocation);
+
+          await updateUserLocation(
+            currentUser.id,
+            currentUser.username,
+            simulatedLocation.latitude,
+            simulatedLocation.longitude,
+            simulatedHeading
+          );
+        }, 2000);
+
         return;
       }
 
@@ -1144,6 +1198,9 @@ export default function App() {
 
     return () => {
       isMounted = false;
+      if (webSimulationTimer) {
+        clearInterval(webSimulationTimer);
+      }
       if (locationSubscription) {
         locationSubscription.remove();
       }
@@ -1463,84 +1520,35 @@ export default function App() {
             </View>
           ) : (
             <>
-              <MapView
-                ref={(instance) => {
-                  mapRef.current = instance;
-                }}
-                key={currentLocation ? `${currentLocation.latitude}-${currentLocation.longitude}` : 'default-map'}
-                style={styles.map}
-                initialRegion={
-                  currentLocation
-                    ? {
-                        latitude: currentLocation.latitude,
-                        longitude: currentLocation.longitude,
-                        latitudeDelta: 0.0922,
-                        longitudeDelta: 0.0421,
-                      }
-                    : DEFAULT_MAP_REGION
-                }
-                mapType="satellite"
-                rotateEnabled={currentUser.role === 'participant' && activeEventId !== null}
-              >
-                {currentLocation && (
-                  isParticipantNormalNavigation ? (
-                    <Marker
-                      coordinate={{
-                        latitude: currentLocation.latitude,
-                        longitude: currentLocation.longitude,
-                      }}
-                      title="Ma position"
-                      description={currentUser.username}
-                      anchor={{ x: 0.5, y: 0.5 }}
-                      flat
-                      tracksViewChanges
-                    >
-                      <View style={styles.participantArrowContainer}>
-                        <Text
-                          style={[
-                            styles.participantArrowGlyph,
-                            {
-                              color: '#2563eb',
-                              transform: [{ rotate: `${normalizeDegrees(currentHeading)}deg` }],
-                            },
-                          ]}
-                        >
-                          ▲
-                        </Text>
-                      </View>
-                    </Marker>
-                  ) : (
-                    <Marker
-                      coordinate={{
-                        latitude: currentLocation.latitude,
-                        longitude: currentLocation.longitude,
-                      }}
-                      title="Ma position"
-                      description={currentUser.username}
-                      pinColor={getMarkerColorByRole(currentUser.role)}
-                    />
-                  )
-                )}
-
-                {userLocations.map((location: UserLocation) => {
-                  if (location.userId === currentUser.id) return null;
-                  const user = users.find((u: User) => u.id === location.userId);
-                  if (!user) return null;
-
-                  if (isParticipantNormalNavigation && user.role !== 'participant') {
-                    return null;
+              {canRenderNativeMap ? (
+                <MapView
+                  ref={(instance: any) => {
+                    mapRef.current = instance;
+                  }}
+                  key={currentLocation ? `${currentLocation.latitude}-${currentLocation.longitude}` : 'default-map'}
+                  style={styles.map}
+                  initialRegion={
+                    currentLocation
+                      ? {
+                          latitude: currentLocation.latitude,
+                          longitude: currentLocation.longitude,
+                          latitudeDelta: 0.0922,
+                          longitudeDelta: 0.0421,
+                        }
+                      : DEFAULT_MAP_REGION
                   }
-
-                  if (isParticipantNormalNavigation) {
-                    return (
+                  mapType="satellite"
+                  rotateEnabled={currentUser.role === 'participant' && activeEventId !== null}
+                >
+                  {currentLocation && (
+                    isParticipantNormalNavigation ? (
                       <Marker
-                        key={location.userId}
                         coordinate={{
-                          latitude: location.latitude,
-                          longitude: location.longitude,
+                          latitude: currentLocation.latitude,
+                          longitude: currentLocation.longitude,
                         }}
-                        title={location.username}
-                        description="Participant"
+                        title="Ma position"
+                        description={currentUser.username}
                         anchor={{ x: 0.5, y: 0.5 }}
                         flat
                         tracksViewChanges
@@ -1550,8 +1558,8 @@ export default function App() {
                             style={[
                               styles.participantArrowGlyph,
                               {
-                                color: '#dc2626',
-                                transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
+                                color: '#2563eb',
+                                transform: [{ rotate: `${normalizeDegrees(currentHeading)}deg` }],
                               },
                             ]}
                           >
@@ -1559,56 +1567,127 @@ export default function App() {
                           </Text>
                         </View>
                       </Marker>
-                    );
-                  }
-
-                  return (
-                    <Marker
-                      key={location.userId}
-                      coordinate={{
-                        latitude: location.latitude,
-                        longitude: location.longitude,
-                      }}
-                      title={location.username}
-                      description={`Role: ${user.role}`}
-                      pinColor={getMarkerColorByRole(user.role)}
-                    />
-                  );
-                })}
-
-                {visibleEvents.map((visibleEvent: VisibleEvent) => {
-                  const { event, index, points } = visibleEvent;
-                  const color = EVENT_COLORS[index % EVENT_COLORS.length];
-                  const isSelected = event.id === selectedEventId;
-                  const isActive = event.id === activeEventId;
-
-                  return (
-                    <Fragment key={event.id}>
-                      <Polyline
-                        coordinates={points}
-                        strokeColor={isSelected || isActive ? '#22c55e' : color}
-                        strokeWidth={isSelected || isActive ? 6 : 4}
-                      />
+                    ) : (
                       <Marker
-                        coordinate={points[0]}
-                        title={event.name}
-                        description={`${event.date} ${event.startTime} - ${event.endTime}`}
-                        pinColor={isSelected || isActive ? '#22c55e' : color}
-                        onPress={() => {
-                          if (currentUser.role === 'participant') {
-                            setSelectedEventId(event.id);
-                          }
+                        coordinate={{
+                          latitude: currentLocation.latitude,
+                          longitude: currentLocation.longitude,
                         }}
+                        title="Ma position"
+                        description={currentUser.username}
+                        pinColor={getMarkerColorByRole(currentUser.role)}
                       />
-                    </Fragment>
-                  );
-                })}
-              </MapView>
+                    )
+                  )}
 
-              {!currentLocation && (
+                  {userLocations.map((location: UserLocation) => {
+                    if (location.userId === currentUser.id) return null;
+                    const user = users.find((u: User) => u.id === location.userId);
+                    if (!user) return null;
+
+                    if (isParticipantNormalNavigation && user.role !== 'participant') {
+                      return null;
+                    }
+
+                    if (isParticipantNormalNavigation) {
+                      return (
+                        <Marker
+                          key={location.userId}
+                          coordinate={{
+                            latitude: location.latitude,
+                            longitude: location.longitude,
+                          }}
+                          title={location.username}
+                          description="Participant"
+                          anchor={{ x: 0.5, y: 0.5 }}
+                          flat
+                          tracksViewChanges
+                        >
+                          <View style={styles.participantArrowContainer}>
+                            <Text
+                              style={[
+                                styles.participantArrowGlyph,
+                                {
+                                  color: '#dc2626',
+                                  transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
+                                },
+                              ]}
+                            >
+                              ▲
+                            </Text>
+                          </View>
+                        </Marker>
+                      );
+                    }
+
+                    return (
+                      <Marker
+                        key={location.userId}
+                        coordinate={{
+                          latitude: location.latitude,
+                          longitude: location.longitude,
+                        }}
+                        title={location.username}
+                        description={`Role: ${user.role}`}
+                        pinColor={getMarkerColorByRole(user.role)}
+                      />
+                    );
+                  })}
+
+                  {visibleEvents.map((visibleEvent: VisibleEvent) => {
+                    const { event, index, points } = visibleEvent;
+                    const color = EVENT_COLORS[index % EVENT_COLORS.length];
+                    const isSelected = event.id === selectedEventId;
+                    const isActive = event.id === activeEventId;
+
+                    return (
+                      <Fragment key={event.id}>
+                        <Polyline
+                          coordinates={points}
+                          strokeColor={isSelected || isActive ? '#22c55e' : color}
+                          strokeWidth={isSelected || isActive ? 6 : 4}
+                        />
+                        <Marker
+                          coordinate={points[0]}
+                          title={event.name}
+                          description={`${event.date} ${event.startTime} - ${event.endTime}`}
+                          pinColor={isSelected || isActive ? '#22c55e' : color}
+                          onPress={() => {
+                            if (currentUser.role === 'participant') {
+                              setSelectedEventId(event.id);
+                            }
+                          }}
+                        />
+                      </Fragment>
+                    );
+                  })}
+                </MapView>
+              ) : (
+                <View style={styles.mapWebFallback}>
+                  <Text style={styles.mapWebFallbackTitle}>Mode Web ordinateur</Text>
+                  <Text style={styles.mapWebFallbackText}>
+                    Carte native indisponible ici. La position est simulée autour de Mende (48).
+                  </Text>
+                  {currentLocation && (
+                    <Text style={styles.mapWebFallbackCoords}>
+                      Position simulée: {currentLocation.latitude.toFixed(5)}, {currentLocation.longitude.toFixed(5)}
+                    </Text>
+                  )}
+                </View>
+              )}
+
+              {!currentLocation && Platform.OS !== 'web' && (
                 <View style={styles.mapNotice} pointerEvents="none">
                   <Text style={styles.mapNoticeText}>
                     Position GPS indisponible. La carte affiche quand meme les evenements.
+                  </Text>
+                </View>
+              )}
+
+              {Platform.OS === 'web' && (
+                <View style={styles.mapNotice} pointerEvents="none">
+                  <Text style={styles.mapNoticeText}>
+                    Session web détectée: position simulée sur Mende (48).
                   </Text>
                 </View>
               )}
@@ -2363,6 +2442,32 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
     lineHeight: 18,
+  },
+  mapWebFallback: {
+    flex: 1,
+    backgroundColor: '#102a43',
+    borderWidth: 1,
+    borderColor: '#486581',
+    borderRadius: 12,
+    margin: 12,
+    padding: 16,
+    justifyContent: 'center',
+    gap: 8,
+  },
+  mapWebFallbackTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#f0f4f8',
+  },
+  mapWebFallbackText: {
+    fontSize: 14,
+    color: '#d9e2ec',
+    lineHeight: 20,
+  },
+  mapWebFallbackCoords: {
+    fontSize: 14,
+    color: '#9fb3c8',
+    fontWeight: '600',
   },
   mapPlaceholder: {
     flex: 1,
