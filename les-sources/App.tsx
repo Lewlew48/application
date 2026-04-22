@@ -2,12 +2,14 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { StatusBar } from 'expo-status-bar';
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   FlatList,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   SafeAreaView,
@@ -59,10 +61,21 @@ type VisibleEvent = {
 };
 
 type EventPickerTarget = 'date' | 'startTime' | 'endTime' | null;
+type NavigationMode = 'normal' | 'focus';
+
+type EmergencyAlert = {
+  id: string;
+  userId: string;
+  username: string;
+  eventId: string;
+  eventName: string;
+  timestamp: number;
+};
 
 const STORAGE_KEY = 'les-sources-users-v1';
 const STORAGE_LOCATIONS_KEY = 'les-sources-locations-v1';
 const STORAGE_EVENTS_KEY = 'les-sources-events-v1';
+const STORAGE_EMERGENCY_ALERTS_KEY = 'les-sources-emergency-alerts-v1';
 
 const DEFAULT_USERS: User[] = [
   {
@@ -81,6 +94,7 @@ const DEFAULT_MAP_REGION = {
 };
 
 const EVENT_COLORS = ['#ef4444', '#2563eb', '#f59e0b', '#10b981', '#8b5cf6'];
+const EARTH_RADIUS_METERS = 6371000;
 
 const formatTime = (date: Date) => {
   const hours = String(date.getHours()).padStart(2, '0');
@@ -93,6 +107,113 @@ const mergeDateAndTime = (dateSource: Date, timeSource: Date) => {
   merged.setHours(timeSource.getHours(), timeSource.getMinutes(), 0, 0);
   return merged;
 };
+
+const toRadians = (value: number) => (value * Math.PI) / 180;
+
+const haversineDistanceMeters = (
+  pointA: { latitude: number; longitude: number },
+  pointB: { latitude: number; longitude: number }
+) => {
+  const lat1 = toRadians(pointA.latitude);
+  const lat2 = toRadians(pointB.latitude);
+  const deltaLat = toRadians(pointB.latitude - pointA.latitude);
+  const deltaLng = toRadians(pointB.longitude - pointA.longitude);
+
+  const a =
+    Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return EARTH_RADIUS_METERS * c;
+};
+
+const bearingDegrees = (
+  from: { latitude: number; longitude: number },
+  to: { latitude: number; longitude: number }
+) => {
+  const fromLat = toRadians(from.latitude);
+  const fromLng = toRadians(from.longitude);
+  const toLat = toRadians(to.latitude);
+  const toLng = toRadians(to.longitude);
+  const y = Math.sin(toLng - fromLng) * Math.cos(toLat);
+  const x =
+    Math.cos(fromLat) * Math.sin(toLat) -
+    Math.sin(fromLat) * Math.cos(toLat) * Math.cos(toLng - fromLng);
+  return (Math.atan2(y, x) * 180) / Math.PI + 360;
+};
+
+const normalizeDegrees = (degrees: number) => {
+  const normalized = degrees % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+};
+
+const pointToSegmentDistanceMeters = (
+  point: { latitude: number; longitude: number },
+  segStart: { latitude: number; longitude: number },
+  segEnd: { latitude: number; longitude: number }
+) => {
+  const latRef = toRadians(point.latitude);
+  const project = (candidate: { latitude: number; longitude: number }) => {
+    const x =
+      toRadians(candidate.longitude - point.longitude) * Math.cos(latRef) * EARTH_RADIUS_METERS;
+    const y = toRadians(candidate.latitude - point.latitude) * EARTH_RADIUS_METERS;
+    return { x, y };
+  };
+
+  const pointProjected = { x: 0, y: 0 };
+  const startProjected = project(segStart);
+  const endProjected = project(segEnd);
+
+  const segmentX = endProjected.x - startProjected.x;
+  const segmentY = endProjected.y - startProjected.y;
+  const segmentLengthSquared = segmentX * segmentX + segmentY * segmentY;
+
+  if (segmentLengthSquared === 0) {
+    return Math.sqrt(startProjected.x * startProjected.x + startProjected.y * startProjected.y);
+  }
+
+  const projectionFactor =
+    ((pointProjected.x - startProjected.x) * segmentX +
+      (pointProjected.y - startProjected.y) * segmentY) /
+    segmentLengthSquared;
+  const clamped = Math.max(0, Math.min(1, projectionFactor));
+
+  const closestX = startProjected.x + clamped * segmentX;
+  const closestY = startProjected.y + clamped * segmentY;
+  return Math.sqrt(closestX * closestX + closestY * closestY);
+};
+
+const distanceToPolylineMeters = (
+  point: { latitude: number; longitude: number },
+  polyline: EventTrackPoint[]
+) => {
+  if (polyline.length < 2) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  let minimumDistance = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < polyline.length - 1; i += 1) {
+    const currentDistance = pointToSegmentDistanceMeters(point, polyline[i], polyline[i + 1]);
+    if (currentDistance < minimumDistance) {
+      minimumDistance = currentDistance;
+    }
+  }
+
+  return minimumDistance;
+};
+
+const routeLengthMeters = (points: EventTrackPoint[]) => {
+  if (points.length < 2) {
+    return 0;
+  }
+
+  let sum = 0;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    sum += haversineDistanceMeters(points[i], points[i + 1]);
+  }
+  return sum;
+};
+
+const formatKm = (distanceMeters: number) => `${(distanceMeters / 1000).toFixed(2)} km`;
 
 const getLocalDateKey = (date: Date) => {
   const year = date.getFullYear();
@@ -160,6 +281,22 @@ export default function App() {
   const [eventPickerTarget, setEventPickerTarget] = useState<EventPickerTarget>(null);
   const [eventPickerValue, setEventPickerValue] = useState(new Date());
 
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [activeEventId, setActiveEventId] = useState<string | null>(null);
+  const [navigationMode, setNavigationMode] = useState<NavigationMode>('normal');
+  const [nextWaypointIndex, setNextWaypointIndex] = useState(0);
+  const [distanceTravelledMeters, setDistanceTravelledMeters] = useState(0);
+  const [navigationStartedAt, setNavigationStartedAt] = useState<number | null>(null);
+  const [currentSpeedKmh, setCurrentSpeedKmh] = useState(0);
+  const [currentHeading, setCurrentHeading] = useState(0);
+  const [offRouteDistanceMeters, setOffRouteDistanceMeters] = useState(0);
+  const [showOffRouteAlert, setShowOffRouteAlert] = useState(false);
+  const [emergencyAlerts, setEmergencyAlerts] = useState<EmergencyAlert[]>([]);
+  const [emergencyCountdown, setEmergencyCountdown] = useState<number | null>(null);
+
+  const mapRef = useRef<MapView | null>(null);
+  const previousNavigationPositionRef = useRef<{ latitude: number; longitude: number } | null>(null);
+
   const [accountUsername, setAccountUsername] = useState('');
   const [accountPassword, setAccountPassword] = useState('');
 
@@ -167,6 +304,7 @@ export default function App() {
     loadUsers();
     loadUserLocations();
     loadEvents();
+    loadEmergencyAlerts();
   }, []);
 
   useEffect(() => {
@@ -243,6 +381,23 @@ export default function App() {
   const persistEvents = async (nextEvents: EventItem[]) => {
     setEvents(nextEvents);
     await AsyncStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(nextEvents));
+  };
+
+  const loadEmergencyAlerts = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(STORAGE_EMERGENCY_ALERTS_KEY);
+      if (raw) {
+        const parsed: EmergencyAlert[] = JSON.parse(raw);
+        setEmergencyAlerts(parsed);
+      }
+    } catch {
+      setEmergencyAlerts([]);
+    }
+  };
+
+  const persistEmergencyAlerts = async (nextAlerts: EmergencyAlert[]) => {
+    setEmergencyAlerts(nextAlerts);
+    await AsyncStorage.setItem(STORAGE_EMERGENCY_ALERTS_KEY, JSON.stringify(nextAlerts));
   };
 
   const handlePickGpxFile = async () => {
@@ -547,6 +702,236 @@ export default function App() {
     }
   };
 
+  const activeEvent = useMemo(() => {
+    if (!activeEventId) {
+      return null;
+    }
+    return events.find((event: EventItem) => event.id === activeEventId) ?? null;
+  }, [activeEventId, events]);
+
+  const activeEventPoints = useMemo(() => {
+    if (!activeEvent) {
+      return [] as EventTrackPoint[];
+    }
+    return parseGpxTrackPoints(activeEvent.gpxText);
+  }, [activeEvent]);
+
+  const activeRouteLengthMeters = useMemo(() => routeLengthMeters(activeEventPoints), [activeEventPoints]);
+
+  const handleStartEventNavigation = () => {
+    if (!selectedEventId || currentUser?.role !== 'participant') {
+      return;
+    }
+
+    const eventToStart = events.find((event: EventItem) => event.id === selectedEventId);
+    if (!eventToStart) {
+      Alert.alert('Erreur', 'Evenement introuvable.');
+      return;
+    }
+
+    const points = parseGpxTrackPoints(eventToStart.gpxText);
+    if (points.length < 2) {
+      Alert.alert('Erreur', 'Le parcours de cet evenement est invalide.');
+      return;
+    }
+
+    setActiveEventId(eventToStart.id);
+    setNavigationMode('normal');
+    setDistanceTravelledMeters(0);
+    setNavigationStartedAt(Date.now());
+    previousNavigationPositionRef.current = currentLocation
+      ? { latitude: currentLocation.latitude, longitude: currentLocation.longitude }
+      : null;
+
+    if (currentLocation) {
+      let nearestIndex = 0;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      points.forEach((point, index) => {
+        const distance = haversineDistanceMeters(currentLocation, point);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestIndex = index;
+        }
+      });
+      setNextWaypointIndex(nearestIndex);
+    } else {
+      setNextWaypointIndex(0);
+    }
+  };
+
+  const handleStopEventNavigation = () => {
+    setActiveEventId(null);
+    setNavigationMode('normal');
+    setNextWaypointIndex(0);
+    setDistanceTravelledMeters(0);
+    setNavigationStartedAt(null);
+    setCurrentSpeedKmh(0);
+    setOffRouteDistanceMeters(0);
+    setShowOffRouteAlert(false);
+    setEmergencyCountdown(null);
+    previousNavigationPositionRef.current = null;
+  };
+
+  const triggerEmergency = async () => {
+    if (!currentUser || !activeEvent || currentUser.role !== 'participant') {
+      return;
+    }
+
+    const nextAlert: EmergencyAlert = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      userId: currentUser.id,
+      username: currentUser.username,
+      eventId: activeEvent.id,
+      eventName: activeEvent.name,
+      timestamp: Date.now(),
+    };
+
+    const nextAlerts = [nextAlert, ...emergencyAlerts].slice(0, 50);
+    await persistEmergencyAlerts(nextAlerts);
+    setEmergencyCountdown(5);
+    Alert.alert('Urgence envoyee', 'Les administrateurs ont ete notifies. Appel auto dans 5 secondes.');
+  };
+
+  useEffect(() => {
+    if (emergencyCountdown === null) {
+      return;
+    }
+
+    if (emergencyCountdown <= 0) {
+      setEmergencyCountdown(null);
+      Linking.canOpenURL('tel:0788478285').then((canCall: boolean) => {
+        if (canCall) {
+          Linking.openURL('tel:0788478285');
+        }
+      });
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setEmergencyCountdown((previous: number | null) => (previous === null ? null : previous - 1));
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [emergencyCountdown]);
+
+  useEffect(() => {
+    if (currentUser?.role !== 'participant' || !activeEventId) {
+      deactivateKeepAwake('navigation-active');
+      return;
+    }
+
+    activateKeepAwakeAsync('navigation-active');
+    return () => {
+      deactivateKeepAwake('navigation-active');
+    };
+  }, [currentUser?.role, activeEventId]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      return;
+    }
+
+    let locationSubscription: Location.LocationSubscription | null = null;
+    let isMounted = true;
+
+    const startWatcher = async () => {
+      const permission = await requestLocationPermission();
+      if (!permission || !isMounted) {
+        return;
+      }
+
+      locationSubscription = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: 1500,
+          distanceInterval: 1,
+        },
+        async (location: Location.LocationObject) => {
+          const updatedLocation = {
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+          };
+
+          setCurrentLocation(updatedLocation);
+          const speed = location.coords.speed ?? 0;
+          setCurrentSpeedKmh(Math.max(0, speed * 3.6));
+
+          if (typeof location.coords.heading === 'number' && location.coords.heading >= 0) {
+            setCurrentHeading(location.coords.heading);
+          }
+
+          await updateUserLocation(
+            currentUser.id,
+            currentUser.username,
+            updatedLocation.latitude,
+            updatedLocation.longitude
+          );
+
+          if (currentUser.role !== 'participant' || !activeEventId || activeEventPoints.length < 2) {
+            return;
+          }
+
+          const previous = previousNavigationPositionRef.current;
+          if (previous) {
+            const stepDistance = haversineDistanceMeters(previous, updatedLocation);
+            if (stepDistance <= 200) {
+              setDistanceTravelledMeters((value: number) => value + stepDistance);
+            }
+          }
+          previousNavigationPositionRef.current = updatedLocation;
+
+          const currentTarget = activeEventPoints[Math.min(nextWaypointIndex, activeEventPoints.length - 1)];
+          const distanceToTarget = haversineDistanceMeters(updatedLocation, currentTarget);
+          if (distanceToTarget < 15 && nextWaypointIndex < activeEventPoints.length - 1) {
+            setNextWaypointIndex((value: number) => Math.min(value + 1, activeEventPoints.length - 1));
+          }
+
+          const routeDistance = distanceToPolylineMeters(updatedLocation, activeEventPoints);
+          setOffRouteDistanceMeters(routeDistance);
+
+          if (routeDistance > 10 && !showOffRouteAlert) {
+            setShowOffRouteAlert(true);
+            Alert.alert('Alerte parcours', 'Tu t éloignes du parcours de plus de 10 m.');
+          }
+
+          if (routeDistance <= 10 && showOffRouteAlert) {
+            setShowOffRouteAlert(false);
+          }
+
+          if (navigationMode === 'normal' && mapRef.current) {
+            const zoom = distanceToTarget < 35 ? 18 : 16;
+            mapRef.current.animateCamera(
+              {
+                center: updatedLocation,
+                heading: normalizeDegrees(currentHeading),
+                pitch: 45,
+                zoom,
+              },
+              { duration: 600 }
+            );
+          }
+        }
+      );
+    };
+
+    startWatcher();
+
+    return () => {
+      isMounted = false;
+      if (locationSubscription) {
+        locationSubscription.remove();
+      }
+    };
+  }, [
+    activeEventId,
+    activeEventPoints,
+    currentHeading,
+    currentUser,
+    navigationMode,
+    nextWaypointIndex,
+    showOffRouteAlert,
+  ]);
+
   const handleUpdateAccount = async () => {
     if (!currentUser) {
       return;
@@ -617,6 +1002,71 @@ export default function App() {
       return leftStamp.localeCompare(rightStamp);
     });
   }, [events]);
+
+  const selectedEvent = useMemo(() => {
+    if (!selectedEventId) {
+      return null;
+    }
+    return events.find((event: EventItem) => event.id === selectedEventId) ?? null;
+  }, [events, selectedEventId]);
+
+  const selectedEventPoints = useMemo(
+    () => (selectedEvent ? parseGpxTrackPoints(selectedEvent.gpxText) : []),
+    [selectedEvent]
+  );
+
+  const nextWaypoint = useMemo(() => {
+    if (!activeEventPoints.length) {
+      return null;
+    }
+    return activeEventPoints[Math.min(nextWaypointIndex, activeEventPoints.length - 1)] ?? null;
+  }, [activeEventPoints, nextWaypointIndex]);
+
+  const remainingDistanceMeters = useMemo(() => {
+    if (!currentLocation || !nextWaypoint || activeEventPoints.length < 2) {
+      return Math.max(0, activeRouteLengthMeters - distanceTravelledMeters);
+    }
+
+    let remaining = haversineDistanceMeters(currentLocation, nextWaypoint);
+    for (let i = nextWaypointIndex; i < activeEventPoints.length - 1; i += 1) {
+      remaining += haversineDistanceMeters(activeEventPoints[i], activeEventPoints[i + 1]);
+    }
+    return remaining;
+  }, [
+    activeEventPoints,
+    activeRouteLengthMeters,
+    currentLocation,
+    distanceTravelledMeters,
+    nextWaypoint,
+    nextWaypointIndex,
+  ]);
+
+  const averageSpeedKmh = useMemo(() => {
+    if (!navigationStartedAt) {
+      return 0;
+    }
+
+    const elapsedHours = (Date.now() - navigationStartedAt) / 3600000;
+    if (elapsedHours <= 0) {
+      return 0;
+    }
+
+    return (distanceTravelledMeters / 1000) / elapsedHours;
+  }, [distanceTravelledMeters, navigationStartedAt]);
+
+  const directionToNextPoint = useMemo(() => {
+    if (!currentLocation || !nextWaypoint) {
+      return 0;
+    }
+
+    const bearing = bearingDegrees(currentLocation, nextWaypoint);
+    return normalizeDegrees(bearing - currentHeading);
+  }, [currentHeading, currentLocation, nextWaypoint]);
+
+  const emergencyAlertsForAdmins = useMemo(
+    () => emergencyAlerts.slice(0, 5),
+    [emergencyAlerts]
+  );
 
   if (!isReady) {
     return (
@@ -711,98 +1161,279 @@ export default function App() {
       {/* Content pages */}
       {currentPage === 'carte' ? (
         <View style={styles.carteContainer}>
-          <MapView
-            key={currentLocation ? `${currentLocation.latitude}-${currentLocation.longitude}` : 'default-map'}
-            style={styles.map}
-            initialRegion={currentLocation ? {
-              latitude: currentLocation.latitude,
-              longitude: currentLocation.longitude,
-              latitudeDelta: 0.0922,
-              longitudeDelta: 0.0421,
-            } : DEFAULT_MAP_REGION}
-            mapType="satellite"
-          >
-            {currentLocation && (
-              <Marker
-                coordinate={{
-                  latitude: currentLocation.latitude,
-                  longitude: currentLocation.longitude,
-                }}
-                title="Ma position"
-                description={currentUser.username}
-                pinColor={getMarkerColorByRole(currentUser.role)}
-              />
-            )}
+          {currentUser.role === 'participant' && activeEventId && navigationMode === 'focus' ? (
+            <View style={styles.focusContainer}>
+              <Text style={styles.focusTitle}>Mode Focus</Text>
+              <Text style={styles.focusSubtitle}>Suis la flèche vers le prochain point</Text>
 
-            {userLocations.map((location: UserLocation) => {
-              if (location.userId === currentUser.id) return null;
-              const user = users.find((u: User) => u.id === location.userId);
-              if (!user) return null;
-
-              return (
-                <Marker
-                  key={location.userId}
-                  coordinate={{
-                    latitude: location.latitude,
-                    longitude: location.longitude,
-                  }}
-                  title={location.username}
-                  description={`Role: ${user.role}`}
-                  pinColor={getMarkerColorByRole(user.role)}
+              <View style={styles.focusArrowFrame}>
+                <View
+                  style={[
+                    styles.focusArrow,
+                    {
+                      transform: [{ rotate: `${directionToNextPoint}deg` }],
+                    },
+                  ]}
                 />
-              );
-            })}
+              </View>
 
-            {visibleEvents.map((visibleEvent: VisibleEvent) => {
-              const { event, index, points } = visibleEvent;
-              const color = EVENT_COLORS[index % EVENT_COLORS.length];
+              <View style={styles.navigationMetricsCard}>
+                <Text style={styles.navigationMetric}>Vitesse: {currentSpeedKmh.toFixed(1)} km/h</Text>
+                <Text style={styles.navigationMetric}>Vitesse moyenne: {averageSpeedKmh.toFixed(1)} km/h</Text>
+                <Text style={styles.navigationMetric}>Parcourus: {formatKm(distanceTravelledMeters)}</Text>
+                <Text style={styles.navigationMetric}>Restants: {formatKm(Math.max(0, remainingDistanceMeters))}</Text>
+                <Text style={styles.navigationMetricAlert}>
+                  {offRouteDistanceMeters > 10
+                    ? `Alerte éloignement: ${offRouteDistanceMeters.toFixed(1)} m`
+                    : `Sur parcours (${offRouteDistanceMeters.toFixed(1)} m)`}
+                </Text>
+              </View>
 
-              return (
-                <Fragment key={event.id}>
-                  <Polyline coordinates={points} strokeColor={color} strokeWidth={4} />
-                  <Marker
-                    coordinate={points[0]}
-                    title={event.name}
-                    description={`${event.date} ${event.startTime} - ${event.endTime}`}
-                    pinColor={color}
-                  />
-                  <Marker
-                    coordinate={points[points.length - 1]}
-                    title={`${event.name} - fin`}
-                    pinColor={color}
-                  />
-                </Fragment>
-              );
-            })}
-          </MapView>
+              <View style={styles.modeSwitchRow}>
+                <Pressable
+                  style={[styles.modeButton, navigationMode === 'normal' && styles.modeButtonActive]}
+                  onPress={() => setNavigationMode('normal')}
+                >
+                  <Text
+                    style={[
+                      styles.modeButtonText,
+                      navigationMode === 'normal' && styles.modeButtonTextActive,
+                    ]}
+                  >
+                    Mode normal
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.modeButton, navigationMode === 'focus' && styles.modeButtonActive]}
+                  onPress={() => setNavigationMode('focus')}
+                >
+                  <Text
+                    style={[
+                      styles.modeButtonText,
+                      navigationMode === 'focus' && styles.modeButtonTextActive,
+                    ]}
+                  >
+                    Mode focus
+                  </Text>
+                </Pressable>
+              </View>
 
-          {!currentLocation && (
-            <View style={styles.mapNotice} pointerEvents="none">
-              <Text style={styles.mapNoticeText}>
-                Position GPS indisponible. La carte affiche quand meme les evenements.
-              </Text>
+              <Pressable style={styles.urgencyButton} onPress={triggerEmergency}>
+                <Text style={styles.urgencyButtonText}>
+                  Urgence {emergencyCountdown !== null ? `(${emergencyCountdown}s)` : ''}
+                </Text>
+              </Pressable>
+
+              <Pressable style={styles.secondaryButton} onPress={handleStopEventNavigation}>
+                <Text style={styles.secondaryButtonText}>Arrêter l'évènement</Text>
+              </Pressable>
             </View>
+          ) : (
+            <>
+              <MapView
+                ref={(instance) => {
+                  mapRef.current = instance;
+                }}
+                key={currentLocation ? `${currentLocation.latitude}-${currentLocation.longitude}` : 'default-map'}
+                style={styles.map}
+                initialRegion={
+                  currentLocation
+                    ? {
+                        latitude: currentLocation.latitude,
+                        longitude: currentLocation.longitude,
+                        latitudeDelta: 0.0922,
+                        longitudeDelta: 0.0421,
+                      }
+                    : DEFAULT_MAP_REGION
+                }
+                mapType="satellite"
+                rotateEnabled={currentUser.role === 'participant' && activeEventId !== null}
+              >
+                {currentLocation && (
+                  <Marker
+                    coordinate={{
+                      latitude: currentLocation.latitude,
+                      longitude: currentLocation.longitude,
+                    }}
+                    title="Ma position"
+                    description={currentUser.username}
+                    pinColor={getMarkerColorByRole(currentUser.role)}
+                  />
+                )}
+
+                {userLocations.map((location: UserLocation) => {
+                  if (location.userId === currentUser.id) return null;
+                  const user = users.find((u: User) => u.id === location.userId);
+                  if (!user) return null;
+
+                  return (
+                    <Marker
+                      key={location.userId}
+                      coordinate={{
+                        latitude: location.latitude,
+                        longitude: location.longitude,
+                      }}
+                      title={location.username}
+                      description={`Role: ${user.role}`}
+                      pinColor={getMarkerColorByRole(user.role)}
+                    />
+                  );
+                })}
+
+                {visibleEvents.map((visibleEvent: VisibleEvent) => {
+                  const { event, index, points } = visibleEvent;
+                  const color = EVENT_COLORS[index % EVENT_COLORS.length];
+                  const isSelected = event.id === selectedEventId;
+                  const isActive = event.id === activeEventId;
+
+                  return (
+                    <Fragment key={event.id}>
+                      <Polyline
+                        coordinates={points}
+                        strokeColor={isSelected || isActive ? '#22c55e' : color}
+                        strokeWidth={isSelected || isActive ? 6 : 4}
+                      />
+                      <Marker
+                        coordinate={points[0]}
+                        title={event.name}
+                        description={`${event.date} ${event.startTime} - ${event.endTime}`}
+                        pinColor={isSelected || isActive ? '#22c55e' : color}
+                        onPress={() => {
+                          if (currentUser.role === 'participant') {
+                            setSelectedEventId(event.id);
+                          }
+                        }}
+                      />
+                    </Fragment>
+                  );
+                })}
+              </MapView>
+
+              {!currentLocation && (
+                <View style={styles.mapNotice} pointerEvents="none">
+                  <Text style={styles.mapNoticeText}>
+                    Position GPS indisponible. La carte affiche quand meme les evenements.
+                  </Text>
+                </View>
+              )}
+
+              {currentUser.role === 'participant' && (
+                <View style={styles.participantPanel}>
+                  {!activeEventId ? (
+                    <>
+                      <Text style={styles.participantPanelTitle}>Sélection de l'évènement</Text>
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.eventSelectorRow}>
+                        {visibleEvents.map(({ event }) => (
+                          <Pressable
+                            key={event.id}
+                            style={[
+                              styles.eventSelectorCard,
+                              selectedEventId === event.id && styles.eventSelectorCardActive,
+                            ]}
+                            onPress={() => setSelectedEventId(event.id)}
+                          >
+                            <Text style={styles.eventSelectorTitle}>{event.name}</Text>
+                            <Text style={styles.eventSelectorMeta}>{event.date}</Text>
+                          </Pressable>
+                        ))}
+                      </ScrollView>
+                      {selectedEvent && (
+                        <Pressable style={styles.button} onPress={handleStartEventNavigation}>
+                          <Text style={styles.buttonText}>Lancer l'évènement</Text>
+                        </Pressable>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <Text style={styles.participantPanelTitle}>{activeEvent?.name ?? 'Navigation en cours'}</Text>
+                      <View style={styles.modeSwitchRow}>
+                        <Pressable
+                          style={[styles.modeButton, navigationMode === 'normal' && styles.modeButtonActive]}
+                          onPress={() => setNavigationMode('normal')}
+                        >
+                          <Text
+                            style={[
+                              styles.modeButtonText,
+                              navigationMode === 'normal' && styles.modeButtonTextActive,
+                            ]}
+                          >
+                            Mode normal
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={[styles.modeButton, navigationMode === 'focus' && styles.modeButtonActive]}
+                          onPress={() => setNavigationMode('focus')}
+                        >
+                          <Text
+                            style={[
+                              styles.modeButtonText,
+                              navigationMode === 'focus' && styles.modeButtonTextActive,
+                            ]}
+                          >
+                            Mode focus
+                          </Text>
+                        </Pressable>
+                      </View>
+
+                      <View style={styles.navigationMetricsCard}>
+                        <Text style={styles.navigationMetric}>Vitesse: {currentSpeedKmh.toFixed(1)} km/h</Text>
+                        <Text style={styles.navigationMetric}>Vitesse moyenne: {averageSpeedKmh.toFixed(1)} km/h</Text>
+                        <Text style={styles.navigationMetric}>Parcourus: {formatKm(distanceTravelledMeters)}</Text>
+                        <Text style={styles.navigationMetric}>Restants: {formatKm(Math.max(0, remainingDistanceMeters))}</Text>
+                        <Text style={styles.navigationMetricAlert}>
+                          {offRouteDistanceMeters > 10
+                            ? `Alerte éloignement: ${offRouteDistanceMeters.toFixed(1)} m`
+                            : `Sur parcours (${offRouteDistanceMeters.toFixed(1)} m)`}
+                        </Text>
+                      </View>
+
+                      <View style={styles.actionRow}>
+                        <Pressable style={styles.urgencyButton} onPress={triggerEmergency}>
+                          <Text style={styles.urgencyButtonText}>
+                            Urgence {emergencyCountdown !== null ? `(${emergencyCountdown}s)` : ''}
+                          </Text>
+                        </Pressable>
+                        <Pressable style={styles.secondaryButton} onPress={handleStopEventNavigation}>
+                          <Text style={styles.secondaryButtonText}>Arrêter</Text>
+                        </Pressable>
+                      </View>
+                    </>
+                  )}
+                </View>
+              )}
+
+              {currentUser.role === 'admin' && emergencyAlertsForAdmins.length > 0 && (
+                <View style={styles.adminEmergencyPanel}>
+                  <Text style={styles.adminEmergencyTitle}>Alertes urgences participants</Text>
+                  {emergencyAlertsForAdmins.map((alert) => (
+                    <Text key={alert.id} style={styles.adminEmergencyItem}>
+                      {alert.username} - {alert.eventName} ({new Date(alert.timestamp).toLocaleTimeString()})
+                    </Text>
+                  ))}
+                </View>
+              )}
+
+              {/* Légende */}
+              <View style={styles.legend}>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendColor, { backgroundColor: '#ff8c42' }]} />
+                  <Text style={styles.legendText}>Participant</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendColor, { backgroundColor: '#4b7bff' }]} />
+                  <Text style={styles.legendText}>Bénévole</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendColor, { backgroundColor: '#0f766e' }]} />
+                  <Text style={styles.legendText}>Admin</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
+                  <Text style={styles.legendText}>Evenement GPX</Text>
+                </View>
+              </View>
+            </>
           )}
-
-          {/* Légende */}
-          <View style={styles.legend}>
-            <View style={styles.legendItem}>
-              <View style={[styles.legendColor, { backgroundColor: '#ff8c42' }]} />
-              <Text style={styles.legendText}>Participant</Text>
-            </View>
-            <View style={styles.legendItem}>
-              <View style={[styles.legendColor, { backgroundColor: '#4b7bff' }]} />
-              <Text style={styles.legendText}>Bénévole</Text>
-            </View>
-            <View style={styles.legendItem}>
-              <View style={[styles.legendColor, { backgroundColor: '#0f766e' }]} />
-              <Text style={styles.legendText}>Admin</Text>
-            </View>
-            <View style={styles.legendItem}>
-              <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
-              <Text style={styles.legendText}>Evenement GPX</Text>
-            </View>
-          </View>
         </View>
       ) : currentPage === 'compte' ? (
         <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
@@ -1448,6 +2079,174 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: '#102a43',
+  },
+  participantPanel: {
+    position: 'absolute',
+    left: 12,
+    right: 12,
+    bottom: 130,
+    backgroundColor: 'rgba(255, 255, 255, 0.97)',
+    borderRadius: 12,
+    padding: 12,
+    gap: 10,
+    borderWidth: 1,
+    borderColor: '#d9e2ec',
+  },
+  participantPanelTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#102a43',
+  },
+  eventSelectorRow: {
+    gap: 8,
+  },
+  eventSelectorCard: {
+    minWidth: 150,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#d9e2ec',
+    padding: 10,
+    backgroundColor: '#ffffff',
+  },
+  eventSelectorCardActive: {
+    borderColor: '#0f766e',
+    backgroundColor: '#f0fdfa',
+  },
+  eventSelectorTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#102a43',
+  },
+  eventSelectorMeta: {
+    fontSize: 12,
+    color: '#627d98',
+    marginTop: 4,
+  },
+  navigationMetricsCard: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#d9e2ec',
+    backgroundColor: '#ffffff',
+    padding: 10,
+    gap: 4,
+  },
+  navigationMetric: {
+    fontSize: 13,
+    color: '#334e68',
+    fontWeight: '600',
+  },
+  navigationMetricAlert: {
+    fontSize: 13,
+    color: '#b91c1c',
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  modeSwitchRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  modeButton: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#9fb3c8',
+    borderRadius: 999,
+    paddingVertical: 8,
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+  },
+  modeButtonActive: {
+    backgroundColor: '#0f766e',
+    borderColor: '#0f766e',
+  },
+  modeButtonText: {
+    color: '#334e68',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  modeButtonTextActive: {
+    color: '#ffffff',
+  },
+  actionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+  },
+  urgencyButton: {
+    flex: 1,
+    borderRadius: 10,
+    backgroundColor: '#dc2626',
+    paddingVertical: 11,
+    alignItems: 'center',
+  },
+  urgencyButtonText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  adminEmergencyPanel: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    left: 16,
+    backgroundColor: 'rgba(127, 29, 29, 0.92)',
+    borderRadius: 10,
+    padding: 10,
+    gap: 6,
+  },
+  adminEmergencyTitle: {
+    color: '#fee2e2',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  adminEmergencyItem: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  focusContainer: {
+    flex: 1,
+    padding: 18,
+    backgroundColor: '#061b2b',
+    gap: 14,
+    justifyContent: 'center',
+  },
+  focusTitle: {
+    color: '#e0f2fe',
+    fontSize: 24,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  focusSubtitle: {
+    color: '#bae6fd',
+    textAlign: 'center',
+    fontSize: 14,
+    marginBottom: 8,
+  },
+  focusArrowFrame: {
+    alignSelf: 'center',
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    borderWidth: 2,
+    borderColor: '#1d4ed8',
+    backgroundColor: '#0c4a6e',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
+    elevation: 7,
+  },
+  focusArrow: {
+    width: 0,
+    height: 0,
+    borderLeftWidth: 24,
+    borderRightWidth: 24,
+    borderBottomWidth: 70,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#93c5fd',
   },
   fieldRow: {
     flexDirection: 'row',
