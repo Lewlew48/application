@@ -215,6 +215,18 @@ const routeLengthMeters = (points: EventTrackPoint[]) => {
 
 const formatKm = (distanceMeters: number) => `${(distanceMeters / 1000).toFixed(2)} km`;
 
+const getDirectionArrow = (degrees: number) => {
+  const normalized = normalizeDegrees(degrees);
+  if (normalized < 22.5 || normalized >= 337.5) return '↑';
+  if (normalized < 67.5) return '↗';
+  if (normalized < 112.5) return '→';
+  if (normalized < 157.5) return '↘';
+  if (normalized < 202.5) return '↓';
+  if (normalized < 247.5) return '↙';
+  if (normalized < 292.5) return '←';
+  return '↖';
+};
+
 const getLocalDateKey = (date: Date) => {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -741,6 +753,7 @@ export default function App() {
   }, [activeEvent]);
 
   const activeRouteLengthMeters = useMemo(() => routeLengthMeters(activeEventPoints), [activeEventPoints]);
+  const isParticipantNavigationActive = currentUser?.role === 'participant' && activeEventId !== null;
 
   const handleStartEventNavigation = () => {
     if (!selectedEventId || currentUser?.role !== 'participant') {
@@ -880,12 +893,24 @@ export default function App() {
     }
 
     let locationSubscription: Location.LocationSubscription | null = null;
+    let headingSubscription: Location.LocationSubscription | null = null;
     let isMounted = true;
 
     const startWatcher = async () => {
       const permission = await requestLocationPermission();
       if (!permission || !isMounted) {
         return;
+      }
+
+      try {
+        headingSubscription = await Location.watchHeadingAsync((heading) => {
+          const compassHeading = heading.trueHeading >= 0 ? heading.trueHeading : heading.magHeading;
+          if (typeof compassHeading === 'number' && compassHeading >= 0) {
+            setCurrentHeading(compassHeading);
+          }
+        });
+      } catch (error) {
+        console.error('Erreur boussole:', error);
       }
 
       locationSubscription = await Location.watchPositionAsync(
@@ -968,6 +993,9 @@ export default function App() {
       isMounted = false;
       if (locationSubscription) {
         locationSubscription.remove();
+      }
+      if (headingSubscription) {
+        headingSubscription.remove();
       }
     };
   }, [
@@ -1161,15 +1189,17 @@ export default function App() {
   return (
     <SafeAreaView style={styles.screen}>
       <StatusBar style="dark" />
-      <View style={styles.panelHeader}>
-        <View>
-          <Text style={styles.panelTitle}>Bonjour {currentUser.username}</Text>
-          <Text style={styles.panelSubtitle}>Role: {currentUser.role}</Text>
+      {!isParticipantNavigationActive && (
+        <View style={styles.panelHeader}>
+          <View>
+            <Text style={styles.panelTitle}>Bonjour {currentUser.username}</Text>
+            <Text style={styles.panelSubtitle}>Role: {currentUser.role}</Text>
+          </View>
+          <Pressable style={styles.secondaryButton} onPress={handleLogout}>
+            <Text style={styles.secondaryButtonText}>Deconnexion</Text>
+          </Pressable>
         </View>
-        <Pressable style={styles.secondaryButton} onPress={handleLogout}>
-          <Text style={styles.secondaryButtonText}>Deconnexion</Text>
-        </Pressable>
-      </View>
+      )}
 
       {/* Navigation tabs */}
       <View style={styles.navTabs}>
@@ -1206,8 +1236,16 @@ export default function App() {
         <View style={styles.carteContainer}>
           {currentUser.role === 'participant' && activeEventId && navigationMode === 'focus' ? (
             <View style={styles.focusContainer}>
+              <View style={styles.focusEmergencyWrap}>
+                <Pressable style={styles.focusUrgencyButton} onPress={triggerEmergency}>
+                  <Text style={styles.focusUrgencyButtonText}>
+                    Urgence {emergencyCountdown !== null ? `(${emergencyCountdown}s)` : ''}
+                  </Text>
+                </Pressable>
+              </View>
+
               <Text style={styles.focusTitle}>Mode Focus</Text>
-              <Text style={styles.focusSubtitle}>Suis la flèche vers le prochain point</Text>
+              <Text style={styles.focusSubtitle}>Suis la flèche selon le cap du téléphone</Text>
 
               <View style={styles.focusArrowFrame}>
                 <View
@@ -1260,12 +1298,6 @@ export default function App() {
                   </Text>
                 </Pressable>
               </View>
-
-              <Pressable style={styles.urgencyButton} onPress={triggerEmergency}>
-                <Text style={styles.urgencyButtonText}>
-                  Urgence {emergencyCountdown !== null ? `(${emergencyCountdown}s)` : ''}
-                </Text>
-              </Pressable>
 
               <Pressable style={styles.secondaryButton} onPress={handleStopEventNavigation}>
                 <Text style={styles.secondaryButtonText}>Arrêter l'évènement</Text>
@@ -1423,6 +1455,7 @@ export default function App() {
                         <Text style={styles.navigationMetric}>Vitesse moyenne: {averageSpeedKmh.toFixed(1)} km/h</Text>
                         <Text style={styles.navigationMetric}>Parcourus: {formatKm(distanceTravelledMeters)}</Text>
                         <Text style={styles.navigationMetric}>Restants: {formatKm(Math.max(0, remainingDistanceMeters))}</Text>
+                        <Text style={styles.navigationMetric}>Direction: {getDirectionArrow(directionToNextPoint)} {Math.round(directionToNextPoint)}°</Text>
                         <Text style={styles.navigationMetricAlert}>
                           {offRouteDistanceMeters > 10
                             ? `Alerte éloignement: ${offRouteDistanceMeters.toFixed(1)} m`
@@ -1457,24 +1490,26 @@ export default function App() {
               )}
 
               {/* Légende */}
-              <View style={styles.legend}>
-                <View style={styles.legendItem}>
-                  <View style={[styles.legendColor, { backgroundColor: '#ff8c42' }]} />
-                  <Text style={styles.legendText}>Participant</Text>
+              {!isParticipantNavigationActive || navigationMode !== 'normal' ? (
+                <View style={styles.legend}>
+                  <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: '#ff8c42' }]} />
+                    <Text style={styles.legendText}>Participant</Text>
+                  </View>
+                  <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: '#4b7bff' }]} />
+                    <Text style={styles.legendText}>Bénévole</Text>
+                  </View>
+                  <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: '#0f766e' }]} />
+                    <Text style={styles.legendText}>Admin</Text>
+                  </View>
+                  <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
+                    <Text style={styles.legendText}>Evenement GPX</Text>
+                  </View>
                 </View>
-                <View style={styles.legendItem}>
-                  <View style={[styles.legendColor, { backgroundColor: '#4b7bff' }]} />
-                  <Text style={styles.legendText}>Bénévole</Text>
-                </View>
-                <View style={styles.legendItem}>
-                  <View style={[styles.legendColor, { backgroundColor: '#0f766e' }]} />
-                  <Text style={styles.legendText}>Admin</Text>
-                </View>
-                <View style={styles.legendItem}>
-                  <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
-                  <Text style={styles.legendText}>Evenement GPX</Text>
-                </View>
-              </View>
+              ) : null}
             </>
           )}
         </View>
@@ -2276,6 +2311,24 @@ const styles = StyleSheet.create({
     backgroundColor: '#061b2b',
     gap: 14,
     justifyContent: 'center',
+  },
+  focusEmergencyWrap: {
+    position: 'absolute',
+    top: 14,
+    right: 14,
+    zIndex: 2,
+  },
+  focusUrgencyButton: {
+    borderRadius: 999,
+    backgroundColor: '#dc2626',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+  },
+  focusUrgencyButtonText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 12,
   },
   focusTitle: {
     color: '#e0f2fe',
