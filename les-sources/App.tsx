@@ -36,6 +36,7 @@ type UserLocation = {
   username: string;
   latitude: number;
   longitude: number;
+  heading?: number;
   timestamp: number;
 };
 
@@ -514,7 +515,8 @@ export default function App() {
     userId: string,
     username: string,
     latitude: number,
-    longitude: number
+    longitude: number,
+    heading?: number
   ) => {
     const existingIndex = userLocations.findIndex((loc: UserLocation) => loc.userId === userId);
     const newLocation: UserLocation = {
@@ -522,6 +524,7 @@ export default function App() {
       username,
       latitude,
       longitude,
+      heading,
       timestamp: Date.now(),
     };
 
@@ -585,7 +588,8 @@ export default function App() {
           currentUser.id,
           currentUser.username,
           newLoc.latitude,
-          newLoc.longitude
+          newLoc.longitude,
+          currentHeadingRef.current
         );
       }
     } catch (error) {
@@ -887,6 +891,42 @@ export default function App() {
     activeEventPointsRef.current = activeEventPoints;
   }, [activeEventPoints]);
 
+  const fitNormalNavigationViewport = (
+    locationPoint: { latitude: number; longitude: number } | null,
+    routePoints: EventTrackPoint[],
+    nextIndex: number
+  ) => {
+    if (!mapRef.current || !locationPoint || routePoints.length < 2) {
+      return;
+    }
+
+    const fromIndex = Math.min(Math.max(0, nextIndex), routePoints.length - 1);
+    const nextPoints = routePoints.slice(fromIndex, Math.min(fromIndex + 7, routePoints.length));
+    const pointsToFit = [locationPoint, ...nextPoints];
+
+    if (pointsToFit.length < 2) {
+      return;
+    }
+
+    mapRef.current.fitToCoordinates(pointsToFit, {
+      edgePadding: {
+        top: 90,
+        right: 70,
+        bottom: 190,
+        left: 70,
+      },
+      animated: true,
+    });
+  };
+
+  useEffect(() => {
+    if (currentUser?.role !== 'participant' || !activeEventId || navigationMode !== 'normal') {
+      return;
+    }
+
+    fitNormalNavigationViewport(currentLocation, activeEventPoints, nextWaypointIndex);
+  }, [activeEventId, activeEventPoints, currentLocation, currentUser?.role, navigationMode, nextWaypointIndex]);
+
   useEffect(() => {
     if (!currentUser) {
       return;
@@ -903,7 +943,7 @@ export default function App() {
       }
 
       try {
-        headingSubscription = await Location.watchHeadingAsync((heading) => {
+        headingSubscription = await Location.watchHeadingAsync((heading: Location.LocationHeadingObject) => {
           const compassHeading = heading.trueHeading >= 0 ? heading.trueHeading : heading.magHeading;
           if (typeof compassHeading === 'number' && compassHeading >= 0) {
             setCurrentHeading(compassHeading);
@@ -937,7 +977,10 @@ export default function App() {
             currentUser.id,
             currentUser.username,
             updatedLocation.latitude,
-            updatedLocation.longitude
+            updatedLocation.longitude,
+            typeof location.coords.heading === 'number' && location.coords.heading >= 0
+              ? location.coords.heading
+              : currentHeadingRef.current
           );
 
           const currentEventPoints = activeEventPointsRef.current;
@@ -972,21 +1015,11 @@ export default function App() {
           }
 
           if (navigationModeRef.current === 'normal' && mapRef.current) {
-            const fromIndex = Math.min(nextWaypointIndexRef.current, currentEventPoints.length - 1);
-            const nextPoints = currentEventPoints.slice(fromIndex, Math.min(fromIndex + 7, currentEventPoints.length));
-            const pointsToFit = [updatedLocation, ...nextPoints];
-
-            if (pointsToFit.length >= 2) {
-              mapRef.current.fitToCoordinates(pointsToFit, {
-                edgePadding: {
-                  top: 90,
-                  right: 70,
-                  bottom: 190,
-                  left: 70,
-                },
-                animated: true,
-              });
-            }
+            fitNormalNavigationViewport(
+              updatedLocation,
+              currentEventPoints,
+              nextWaypointIndexRef.current
+            );
           }
         }
       );
@@ -1143,6 +1176,9 @@ export default function App() {
     () => emergencyAlerts.slice(0, 5),
     [emergencyAlerts]
   );
+
+  const isParticipantNormalNavigation =
+    currentUser.role === 'participant' && activeEventId !== null && navigationMode === 'normal';
 
   if (!isReady) {
     return (
@@ -1332,21 +1368,86 @@ export default function App() {
                 rotateEnabled={currentUser.role === 'participant' && activeEventId !== null}
               >
                 {currentLocation && (
-                  <Marker
-                    coordinate={{
-                      latitude: currentLocation.latitude,
-                      longitude: currentLocation.longitude,
-                    }}
-                    title="Ma position"
-                    description={currentUser.username}
-                    pinColor={getMarkerColorByRole(currentUser.role)}
-                  />
+                  isParticipantNormalNavigation ? (
+                    <Marker
+                      coordinate={{
+                        latitude: currentLocation.latitude,
+                        longitude: currentLocation.longitude,
+                      }}
+                      title="Ma position"
+                      description={currentUser.username}
+                      anchor={{ x: 0.5, y: 0.5 }}
+                      flat
+                    >
+                      <View
+                        style={[
+                          styles.participantArrowContainer,
+                          { transform: [{ rotate: `${normalizeDegrees(currentHeading)}deg` }] },
+                        ]}
+                      >
+                        <View
+                          style={[
+                            styles.participantArrow,
+                            { borderBottomColor: '#2563eb' },
+                          ]}
+                        />
+                      </View>
+                    </Marker>
+                  ) : (
+                    <Marker
+                      coordinate={{
+                        latitude: currentLocation.latitude,
+                        longitude: currentLocation.longitude,
+                      }}
+                      title="Ma position"
+                      description={currentUser.username}
+                      pinColor={getMarkerColorByRole(currentUser.role)}
+                    />
+                  )
                 )}
 
                 {userLocations.map((location: UserLocation) => {
                   if (location.userId === currentUser.id) return null;
                   const user = users.find((u: User) => u.id === location.userId);
                   if (!user) return null;
+
+                  if (isParticipantNormalNavigation && user.role !== 'participant') {
+                    return null;
+                  }
+
+                  if (isParticipantNormalNavigation) {
+                    return (
+                      <Marker
+                        key={location.userId}
+                        coordinate={{
+                          latitude: location.latitude,
+                          longitude: location.longitude,
+                        }}
+                        title={location.username}
+                        description="Participant"
+                        anchor={{ x: 0.5, y: 0.5 }}
+                        flat
+                      >
+                        <View
+                          style={[
+                            styles.participantArrowContainer,
+                            {
+                              transform: [
+                                { rotate: `${normalizeDegrees(location.heading ?? 0)}deg` },
+                              ],
+                            },
+                          ]}
+                        >
+                          <View
+                            style={[
+                              styles.participantArrow,
+                              { borderBottomColor: '#dc2626' },
+                            ]}
+                          />
+                        </View>
+                      </Marker>
+                    );
+                  }
 
                   return (
                     <Marker
@@ -2235,6 +2336,21 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#627d98',
     marginTop: 4,
+  },
+  participantArrowContainer: {
+    width: 30,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  participantArrow: {
+    width: 0,
+    height: 0,
+    borderLeftWidth: 8,
+    borderRightWidth: 8,
+    borderBottomWidth: 18,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
   },
   navigationMetricsCard: {
     borderRadius: 10,
