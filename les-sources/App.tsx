@@ -4,6 +4,7 @@ import * as Location from 'expo-location';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { StatusBar } from 'expo-status-bar';
+import { onValue, ref as dbRef, remove, set } from 'firebase/database';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
@@ -20,6 +21,7 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import MapView, { Marker, Polyline } from 'react-native-maps';
+import { firebaseDatabase, isFirebaseEnabled } from './firebase';
 
 type Role = 'admin' | 'benevole' | 'participant';
 type Page = 'admin' | 'carte' | 'compte';
@@ -77,6 +79,10 @@ const STORAGE_KEY = 'les-sources-users-v1';
 const STORAGE_LOCATIONS_KEY = 'les-sources-locations-v1';
 const STORAGE_EVENTS_KEY = 'les-sources-events-v1';
 const STORAGE_EMERGENCY_ALERTS_KEY = 'les-sources-emergency-alerts-v1';
+const CLOUD_USERS_PATH = 'users';
+const CLOUD_LOCATIONS_PATH = 'locations';
+const CLOUD_EVENTS_PATH = 'events';
+const CLOUD_EMERGENCY_ALERTS_PATH = 'emergencyAlerts';
 
 const DEFAULT_USERS: User[] = [
   {
@@ -239,6 +245,28 @@ const isValidDateInput = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value);
 
 const isValidTimeInput = (value: string) => /^\d{2}:\d{2}$/.test(value);
 
+const valuesFromRecord = <T,>(value: unknown): T[] => {
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+
+  return Object.values(value as Record<string, T>);
+};
+
+const mapById = <T extends { id: string }>(items: T[]) => {
+  return items.reduce<Record<string, T>>((record, item) => {
+    record[item.id] = item;
+    return record;
+  }, {});
+};
+
+const mapLocationsByUserId = (items: UserLocation[]) => {
+  return items.reduce<Record<string, UserLocation>>((record, item) => {
+    record[item.userId] = item;
+    return record;
+  }, {});
+};
+
 const parseGpxTrackPoints = (gpxText: string): EventTrackPoint[] => {
   const points: EventTrackPoint[] = [];
   const trackPointPattern = /<trkpt\b[^>]*\blat="([^"]+)"[^>]*\blon="([^"]+)"[^>]*>/gi;
@@ -271,6 +299,7 @@ const isEventVisibleForUser = (event: EventItem, role: Role) => {
 };
 
 export default function App() {
+  const useCloudSync = Boolean(firebaseDatabase && isFirebaseEnabled);
   const [users, setUsers] = useState<User[]>([]);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isReady, setIsReady] = useState(false);
@@ -325,11 +354,57 @@ export default function App() {
   const [accountPassword, setAccountPassword] = useState('');
 
   useEffect(() => {
-    loadUsers();
-    loadUserLocations();
-    loadEvents();
-    loadEmergencyAlerts();
-  }, []);
+    if (!useCloudSync || !firebaseDatabase) {
+      loadUsers();
+      loadUserLocations();
+      loadEvents();
+      loadEmergencyAlerts();
+      return;
+    }
+
+    const unsubscribeUsers = onValue(dbRef(firebaseDatabase, CLOUD_USERS_PATH), async (snapshot) => {
+      const parsedUsers = valuesFromRecord<User>(snapshot.val());
+
+      if (parsedUsers.length === 0) {
+        await set(dbRef(firebaseDatabase, CLOUD_USERS_PATH), mapById(DEFAULT_USERS));
+        setUsers(DEFAULT_USERS);
+        setIsReady(true);
+        return;
+      }
+
+      const hasAdmin = parsedUsers.some((user: User) => user.username === 'admin' && user.role === 'admin');
+      const nextUsers = hasAdmin ? parsedUsers : [...parsedUsers, ...DEFAULT_USERS];
+
+      if (!hasAdmin) {
+        await set(dbRef(firebaseDatabase, CLOUD_USERS_PATH), mapById(nextUsers));
+      }
+
+      setUsers(nextUsers);
+      setIsReady(true);
+    });
+
+    const unsubscribeLocations = onValue(dbRef(firebaseDatabase, CLOUD_LOCATIONS_PATH), (snapshot) => {
+      setUserLocations(valuesFromRecord<UserLocation>(snapshot.val()));
+    });
+
+    const unsubscribeEvents = onValue(dbRef(firebaseDatabase, CLOUD_EVENTS_PATH), (snapshot) => {
+      setEvents(valuesFromRecord<EventItem>(snapshot.val()));
+    });
+
+    const unsubscribeAlerts = onValue(dbRef(firebaseDatabase, CLOUD_EMERGENCY_ALERTS_PATH), (snapshot) => {
+      const nextAlerts = valuesFromRecord<EmergencyAlert>(snapshot.val())
+        .sort((left, right) => right.timestamp - left.timestamp)
+        .slice(0, 50);
+      setEmergencyAlerts(nextAlerts);
+    });
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeLocations();
+      unsubscribeEvents();
+      unsubscribeAlerts();
+    };
+  }, [useCloudSync]);
 
   useEffect(() => {
     if (!currentUser) {
@@ -375,6 +450,11 @@ export default function App() {
 
   const persistUsers = async (nextUsers: User[]) => {
     setUsers(nextUsers);
+    if (useCloudSync && firebaseDatabase) {
+      await set(dbRef(firebaseDatabase, CLOUD_USERS_PATH), mapById(nextUsers));
+      return;
+    }
+
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(nextUsers));
   };
 
@@ -404,6 +484,11 @@ export default function App() {
 
   const persistEvents = async (nextEvents: EventItem[]) => {
     setEvents(nextEvents);
+    if (useCloudSync && firebaseDatabase) {
+      await set(dbRef(firebaseDatabase, CLOUD_EVENTS_PATH), mapById(nextEvents));
+      return;
+    }
+
     await AsyncStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(nextEvents));
   };
 
@@ -421,7 +506,22 @@ export default function App() {
 
   const persistEmergencyAlerts = async (nextAlerts: EmergencyAlert[]) => {
     setEmergencyAlerts(nextAlerts);
+    if (useCloudSync && firebaseDatabase) {
+      await set(dbRef(firebaseDatabase, CLOUD_EMERGENCY_ALERTS_PATH), mapById(nextAlerts));
+      return;
+    }
+
     await AsyncStorage.setItem(STORAGE_EMERGENCY_ALERTS_KEY, JSON.stringify(nextAlerts));
+  };
+
+  const persistUserLocations = async (nextLocations: UserLocation[]) => {
+    setUserLocations(nextLocations);
+    if (useCloudSync && firebaseDatabase) {
+      await set(dbRef(firebaseDatabase, CLOUD_LOCATIONS_PATH), mapLocationsByUserId(nextLocations));
+      return;
+    }
+
+    await AsyncStorage.setItem(STORAGE_LOCATIONS_KEY, JSON.stringify(nextLocations));
   };
 
   const handlePickGpxFile = async () => {
@@ -536,8 +636,7 @@ export default function App() {
       updatedLocations = [...userLocations, newLocation];
     }
 
-    setUserLocations(updatedLocations);
-    await AsyncStorage.setItem(STORAGE_LOCATIONS_KEY, JSON.stringify(updatedLocations));
+    await persistUserLocations(updatedLocations);
   };
 
   const generateMockLocation = () => {
@@ -723,6 +822,13 @@ export default function App() {
 
     const nextUsers = users.filter((u: User) => u.id !== userId);
     await persistUsers(nextUsers);
+
+    const nextLocations = userLocations.filter((loc: UserLocation) => loc.userId !== userId);
+    await persistUserLocations(nextLocations);
+
+    if (useCloudSync && firebaseDatabase) {
+      await remove(dbRef(firebaseDatabase, `${CLOUD_LOCATIONS_PATH}/${userId}`));
+    }
 
     if (currentUser?.id === userId) {
       handleLogout();
@@ -1076,8 +1182,7 @@ export default function App() {
       const nextLocations = userLocations.map((loc: UserLocation) =>
         loc.userId === currentUser.id ? { ...loc, username } : loc
       );
-      setUserLocations(nextLocations);
-      await AsyncStorage.setItem(STORAGE_LOCATIONS_KEY, JSON.stringify(nextLocations));
+      await persistUserLocations(nextLocations);
     }
 
     Alert.alert('Succès', 'Ton compte a ete mis a jour.');

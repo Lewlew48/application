@@ -18,6 +18,15 @@
     "android": {},
     "web": {
       "bundler": "metro"
+    },
+    "extra": {
+      "apiKey": "",
+      "authDomain": "",
+      "databaseURL": "",
+      "projectId": "",
+      "storageBucket": "",
+      "messagingSenderId": "",
+      "appId": ""
     }
   }
 }
