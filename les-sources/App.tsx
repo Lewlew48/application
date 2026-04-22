@@ -220,12 +220,11 @@ export default function App() {
         multiple: false,
       });
 
-      const assets = result.assets ?? [];
-      if (result.canceled || assets.length === 0) {
+      if (result.canceled || !result.assets || result.assets.length === 0) {
         return;
       }
 
-      const asset = assets[0];
+      const asset = result.assets[0];
       const fileName = asset.name ?? 'fichier.gpx';
       if (!fileName.toLowerCase().endsWith('.gpx')) {
         Alert.alert('Erreur', 'Choisis un fichier .gpx.');
@@ -703,18 +702,18 @@ export default function App() {
               </Pressable>
               <Text style={styles.checkboxLabel}>Afficher pour bénévoles</Text>
             </View>
-            <Pressable style={styles.secondaryActionButton} onPress={handlePickGpxFile}>
-              <Text style={styles.secondaryActionButtonText}>Sélectionner un fichier GPX</Text>
+            <Pressable style={styles.secondaryButton} onPress={handlePickGpxFile}>
+              <Text style={styles.secondaryButtonText}>Choisir un fichier GPX</Text>
             </Pressable>
             <Text style={styles.helperText}>
               {eventGpxFileName
                 ? `Fichier sélectionné: ${eventGpxFileName}`
-                : 'Aucun fichier sélectionné. Choisis un fichier .gpx.'}
+                : 'Aucun fichier sélectionné.'}
             </Text>
             <View style={styles.gpxPreviewBox}>
-              <Text style={styles.gpxPreviewLabel}>GPX importé</Text>
-              <Text style={styles.gpxPreviewText} numberOfLines={4}>
-                {eventGpxText ? 'Contenu chargé et prêt à être enregistré.' : 'En attente de sélection.'}
+              <Text style={styles.gpxPreviewLabel}>Statut GPX</Text>
+              <Text style={styles.gpxPreviewText} numberOfLines={3}>
+                {eventGpxText ? 'Le fichier a été chargé et est prêt à être enregistré.' : 'En attente de sélection.'}
               </Text>
             </View>
 
@@ -895,16 +894,16 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 16,
   },
-  secondaryActionButton: {
-    backgroundColor: '#ffffff',
-    borderRadius: 10,
+  secondaryButton: {
     borderWidth: 1,
     borderColor: '#9fb3c8',
+    borderRadius: 10,
     paddingVertical: 12,
     alignItems: 'center',
     marginTop: 2,
+    backgroundColor: '#ffffff',
   },
-  secondaryActionButtonText: {
+  secondaryButtonText: {
     color: '#334e68',
     fontWeight: '700',
     fontSize: 16,
