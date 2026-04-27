@@ -5,7 +5,9 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
+    "icon": "./assets/icon.png",
     "splash": {
+      "image": "./assets/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#f7f7f7"
     },
@@ -13,10 +15,26 @@
       "**/*"
     ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "fr.lessources",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
-    "android": {},
+    "android": {
+      "package": "fr.lessources",
+      "versionCode": 1,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#f7f7f7"
+      }
+    },
     "web": {
+      "favicon": "./assets/favicon.png",
       "bundler": "metro"
     },
     "extra": {
@@ -26,7 +44,10 @@
       "projectId": "",
       "storageBucket": "",
       "messagingSenderId": "",
-      "appId": ""
+      "appId": "",
+      "eas": {
+        "projectId": "e24e48e4-21df-4732-971c-8ba0160fd366"
+      }
     }
   }
 }

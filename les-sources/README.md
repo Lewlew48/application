@@ -103,3 +103,40 @@ Dans les deux cas:
     - **Bleu** (#4b7bff) pour les bénévoles
     - **Vert** (#0f766e) pour les administrateurs
   - L'utilisateur courant est également affiché sur la carte avec une légende
+
+## Publication Android (Google Play Store)
+
+Le projet est configure pour generer un **AAB** (Android App Bundle) via EAS.
+
+### Identifiant Android
+
+- `app.json` utilise actuellement: `expo.android.package = fr.lessources`
+- Si besoin, remplace cette valeur par ton identifiant definitif (exemple: `com.tonorganisation.lessources`)
+
+### Build de production (AAB)
+
+1. Installer les dependances:
+   - `npm.cmd install`
+2. Se connecter a Expo:
+   - `npx eas login`
+3. Lancer la build Android Play Store:
+   - `npm.cmd run build:android`
+
+Le resultat est un fichier **.aab** compatible Google Play.
+
+### Soumission sur Google Play
+
+Option 1 (manuel):
+- Recuperer le `.aab` depuis le lien de build EAS
+- Uploader dans Google Play Console (piste interne recommandee pour le premier test)
+
+Option 2 (automatique via EAS Submit):
+1. Creer un compte service Google Play et la cle JSON
+2. Configurer les credentials dans Expo/EAS
+3. Lancer:
+   - `npm run submit:android`
+
+### Increments de version avant chaque nouvelle release
+
+- Mettre a jour `expo.version` (exemple: `1.0.1`)
+- Incrementer `expo.android.versionCode` (exemple: `2`)

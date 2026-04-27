@@ -8,6 +8,7 @@ import {
   Alert,
   FlatList,
   KeyboardAvoidingView,
+  LayoutChangeEvent,
   Linking,
   Platform,
   Pressable,
@@ -41,6 +42,8 @@ type UserLocation = {
   latitude: number;
   longitude: number;
   heading?: number;
+  isFollowingEvent?: boolean;
+  followingEventId?: string;
   timestamp: number;
 };
 
@@ -349,6 +352,11 @@ export default function App() {
   const [showOffRouteAlert, setShowOffRouteAlert] = useState(false);
   const [emergencyAlerts, setEmergencyAlerts] = useState<EmergencyAlert[]>([]);
   const [emergencyCountdown, setEmergencyCountdown] = useState<number | null>(null);
+  const [mapContainerHeight, setMapContainerHeight] = useState(0);
+  const [mapNoticeLayout, setMapNoticeLayout] = useState<{ y: number; height: number } | null>(null);
+  const [adminEmergencyLayout, setAdminEmergencyLayout] = useState<{ y: number; height: number } | null>(null);
+  const [legendLayout, setLegendLayout] = useState<{ y: number; height: number } | null>(null);
+  const [participantPanelLayout, setParticipantPanelLayout] = useState<{ y: number; height: number } | null>(null);
 
   const mapRef = useRef<any>(null);
   const previousNavigationPositionRef = useRef<{ latitude: number; longitude: number } | null>(null);
@@ -564,7 +572,8 @@ export default function App() {
     username: string,
     latitude: number,
     longitude: number,
-    heading?: number
+    heading?: number,
+    followingEventId?: string
   ) => {
     const existingIndex = userLocations.findIndex((loc: UserLocation) => loc.userId === userId);
     const newLocation: UserLocation = {
@@ -573,6 +582,8 @@ export default function App() {
       latitude,
       longitude,
       heading,
+      isFollowingEvent: Boolean(followingEventId),
+      followingEventId,
       timestamp: Date.now(),
     };
 
@@ -631,7 +642,8 @@ export default function App() {
           currentUser.username,
           simulatedLocation.latitude,
           simulatedLocation.longitude,
-          currentHeadingRef.current
+          currentHeadingRef.current,
+          currentUser.role === 'participant' ? activeEventId ?? undefined : undefined
         );
       }
       return;
@@ -657,7 +669,8 @@ export default function App() {
           currentUser.username,
           newLoc.latitude,
           newLoc.longitude,
-          currentHeadingRef.current
+          currentHeadingRef.current,
+          currentUser.role === 'participant' ? activeEventId ?? undefined : undefined
         );
       }
     } catch (error) {
@@ -886,6 +899,17 @@ export default function App() {
     setShowOffRouteAlert(false);
     setEmergencyCountdown(null);
     previousNavigationPositionRef.current = null;
+
+    if (currentUser?.role === 'participant' && currentLocation) {
+      updateUserLocation(
+        currentUser.id,
+        currentUser.username,
+        currentLocation.latitude,
+        currentLocation.longitude,
+        currentHeadingRef.current,
+        undefined
+      );
+    }
   };
 
   const triggerEmergency = async () => {
@@ -975,7 +999,7 @@ export default function App() {
     locationPoint: { latitude: number; longitude: number } | null,
     routePoints: EventTrackPoint[],
     nextIndex: number,
-    options?: { hasTopOverlay?: boolean; hasBottomOverlay?: boolean }
+    options?: { topPadding?: number; bottomPadding?: number }
   ) => {
     if (!mapRef.current || !locationPoint || routePoints.length < 2) {
       return;
@@ -989,8 +1013,8 @@ export default function App() {
       return;
     }
 
-    const topPadding = options?.hasTopOverlay ? 180 : 90;
-    const bottomPadding = options?.hasBottomOverlay ? 250 : 150;
+    const topPadding = options?.topPadding ?? 90;
+    const bottomPadding = options?.bottomPadding ?? 150;
 
     mapRef.current.fitToCoordinates(pointsToFit, {
       edgePadding: {
@@ -1004,7 +1028,18 @@ export default function App() {
   };
 
   const handleRecenterMap = () => {
-    if (!mapRef.current || !currentLocation) {
+    if (!currentLocation) {
+      return;
+    }
+
+    if (!mapRef.current) {
+      if (Platform.OS === 'web') {
+        const recenteredLocation = {
+          latitude: MENDE_REGION.latitude,
+          longitude: MENDE_REGION.longitude,
+        };
+        setCurrentLocation(recenteredLocation);
+      }
       return;
     }
 
@@ -1019,18 +1054,62 @@ export default function App() {
     );
   };
 
+  const extractLayout = (event: LayoutChangeEvent) => {
+    const { y, height } = event.nativeEvent.layout;
+    return { y, height };
+  };
+
+  const computeTopViewportPadding = () => {
+    let coveredFromTop = 0;
+    if (mapNoticeLayout) {
+      coveredFromTop = Math.max(coveredFromTop, mapNoticeLayout.y + mapNoticeLayout.height);
+    }
+    if (adminEmergencyLayout) {
+      coveredFromTop = Math.max(coveredFromTop, adminEmergencyLayout.y + adminEmergencyLayout.height);
+    }
+    return Math.max(90, Math.ceil(coveredFromTop) + 16);
+  };
+
+  const computeBottomViewportPadding = () => {
+    if (mapContainerHeight <= 0) {
+      return 150;
+    }
+
+    let coveredFromBottom = 0;
+    if (legendLayout) {
+      coveredFromBottom = Math.max(coveredFromBottom, mapContainerHeight - legendLayout.y);
+    }
+    if (participantPanelLayout) {
+      coveredFromBottom = Math.max(coveredFromBottom, mapContainerHeight - participantPanelLayout.y);
+    }
+
+    return Math.max(150, Math.ceil(coveredFromBottom) + 16);
+  };
+
   useEffect(() => {
     if (currentUser?.role !== 'participant' || !activeEventId || navigationMode !== 'normal') {
       return;
     }
 
-    const hasTopOverlay = currentUser.role === 'admin' && emergencyAlerts.length > 0;
-    const hasBottomOverlay = true;
+    const topPadding = computeTopViewportPadding();
+    const bottomPadding = computeBottomViewportPadding();
     fitNormalNavigationViewport(currentLocation, activeEventPoints, nextWaypointIndex, {
-      hasTopOverlay,
-      hasBottomOverlay,
+      topPadding,
+      bottomPadding,
     });
-  }, [activeEventId, activeEventPoints, currentLocation, currentUser?.role, navigationMode, nextWaypointIndex]);
+  }, [
+    activeEventId,
+    activeEventPoints,
+    currentLocation,
+    currentUser?.role,
+    legendLayout,
+    mapContainerHeight,
+    mapNoticeLayout,
+    navigationMode,
+    nextWaypointIndex,
+    participantPanelLayout,
+    adminEmergencyLayout,
+  ]);
 
   useEffect(() => {
     if (!currentUser) {
@@ -1064,7 +1143,8 @@ export default function App() {
             currentUser.username,
             simulatedLocation.latitude,
             simulatedLocation.longitude,
-            simulatedHeading
+            simulatedHeading,
+            currentUser.role === 'participant' ? activeEventId ?? undefined : undefined
           );
         }, 2000);
 
@@ -1109,7 +1189,8 @@ export default function App() {
             updatedLocation.longitude,
             typeof location.coords.heading === 'number' && location.coords.heading >= 0
               ? location.coords.heading
-              : currentHeadingRef.current
+              : currentHeadingRef.current,
+            currentUser.role === 'participant' ? activeEventId ?? undefined : undefined
           );
 
           const currentEventPoints = activeEventPointsRef.current;
@@ -1144,15 +1225,15 @@ export default function App() {
           }
 
           if (navigationModeRef.current === 'normal' && mapRef.current) {
-            const hasTopOverlay = currentUser.role === 'admin' && emergencyAlerts.length > 0;
-            const hasBottomOverlay = true;
+            const topPadding = computeTopViewportPadding();
+            const bottomPadding = computeBottomViewportPadding();
             fitNormalNavigationViewport(
               updatedLocation,
               currentEventPoints,
               nextWaypointIndexRef.current,
               {
-                hasTopOverlay,
-                hasBottomOverlay,
+                topPadding,
+                bottomPadding,
               }
             );
           }
@@ -1176,8 +1257,13 @@ export default function App() {
     };
   }, [
     activeEventId,
+    adminEmergencyLayout,
     currentUser,
     emergencyAlerts.length,
+    legendLayout,
+    mapContainerHeight,
+    mapNoticeLayout,
+    participantPanelLayout,
   ]);
 
   const handleUpdateAccount = async () => {
@@ -1315,6 +1401,29 @@ export default function App() {
     [emergencyAlerts]
   );
 
+  const showMapNoticeOverlay = (!currentLocation && Platform.OS !== 'web') || Platform.OS === 'web';
+  const showParticipantPanelOverlay =
+    currentPage === 'carte' && currentUser?.role === 'participant' && !(activeEventId && navigationMode === 'focus');
+  const showAdminEmergencyOverlay =
+    currentPage === 'carte' && currentUser?.role === 'admin' && emergencyAlertsForAdmins.length > 0;
+  const showLegendOverlay =
+    currentPage === 'carte' && (!isParticipantNavigationActive || navigationMode !== 'normal');
+
+  useEffect(() => {
+    if (!showMapNoticeOverlay) {
+      setMapNoticeLayout(null);
+    }
+    if (!showParticipantPanelOverlay) {
+      setParticipantPanelLayout(null);
+    }
+    if (!showAdminEmergencyOverlay) {
+      setAdminEmergencyLayout(null);
+    }
+    if (!showLegendOverlay) {
+      setLegendLayout(null);
+    }
+  }, [showAdminEmergencyOverlay, showLegendOverlay, showMapNoticeOverlay, showParticipantPanelOverlay]);
+
   const isParticipantNormalNavigation =
     currentUser?.role === 'participant' && activeEventId !== null && navigationMode === 'normal';
 
@@ -1436,7 +1545,12 @@ export default function App() {
 
       {/* Content pages */}
       {currentPage === 'carte' ? (
-        <View style={styles.carteContainer}>
+        <View
+          style={styles.carteContainer}
+          onLayout={(event: LayoutChangeEvent) => {
+            setMapContainerHeight(event.nativeEvent.layout.height);
+          }}
+        >
           {currentUser.role === 'participant' && activeEventId && navigationMode === 'focus' ? (
             <View style={styles.focusContainer}>
               <View style={styles.focusEmergencyWrap}>
@@ -1572,6 +1686,12 @@ export default function App() {
                     const user = users.find((u: User) => u.id === location.userId);
                     if (!user) return null;
 
+                    const isFollowingEventParticipant =
+                      user.role === 'participant' && Boolean(location.isFollowingEvent);
+                    const showFollowingArrowForSupervisor =
+                      (currentUser.role === 'admin' || currentUser.role === 'benevole') &&
+                      isFollowingEventParticipant;
+
                     if (isParticipantNormalNavigation && user.role !== 'participant') {
                       return null;
                     }
@@ -1596,6 +1716,37 @@ export default function App() {
                                 styles.participantArrowGlyph,
                                 {
                                   color: '#dc2626',
+                                  transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
+                                },
+                              ]}
+                            >
+                              ▲
+                            </Text>
+                          </View>
+                        </Marker>
+                      );
+                    }
+
+                    if (showFollowingArrowForSupervisor) {
+                      return (
+                        <Marker
+                          key={location.userId}
+                          coordinate={{
+                            latitude: location.latitude,
+                            longitude: location.longitude,
+                          }}
+                          title={location.username}
+                          description="Participant en suivi d evenement"
+                          anchor={{ x: 0.5, y: 0.5 }}
+                          flat
+                          tracksViewChanges
+                        >
+                          <View style={styles.participantArrowContainer}>
+                            <Text
+                              style={[
+                                styles.participantArrowGlyph,
+                                {
+                                  color: '#ff8c42',
                                   transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
                                 },
                               ]}
@@ -1663,14 +1814,20 @@ export default function App() {
                 </View>
               )}
 
-              {canRenderNativeMap && currentLocation && !isParticipantNavigationActive && (
+              {currentLocation && !isParticipantNavigationActive && (
                 <Pressable style={styles.recenterButton} onPress={handleRecenterMap}>
                   <Text style={styles.recenterButtonText}>Recentrer</Text>
                 </Pressable>
               )}
 
               {!currentLocation && Platform.OS !== 'web' && (
-                <View style={styles.mapNotice} pointerEvents="none">
+                <View
+                  style={styles.mapNotice}
+                  pointerEvents="none"
+                  onLayout={(event: LayoutChangeEvent) => {
+                    setMapNoticeLayout(extractLayout(event));
+                  }}
+                >
                   <Text style={styles.mapNoticeText}>
                     Position GPS indisponible. La carte affiche quand meme les evenements.
                   </Text>
@@ -1678,7 +1835,13 @@ export default function App() {
               )}
 
               {Platform.OS === 'web' && (
-                <View style={styles.mapNotice} pointerEvents="none">
+                <View
+                  style={styles.mapNotice}
+                  pointerEvents="none"
+                  onLayout={(event: LayoutChangeEvent) => {
+                    setMapNoticeLayout(extractLayout(event));
+                  }}
+                >
                   <Text style={styles.mapNoticeText}>
                     Session web détectée: position simulée sur Mende (48).
                   </Text>
@@ -1686,7 +1849,12 @@ export default function App() {
               )}
 
               {currentUser.role === 'participant' && (
-                <View style={[styles.participantPanel, activeEventId && styles.participantPanelActive]}>
+                <View
+                  style={[styles.participantPanel, activeEventId && styles.participantPanelActive]}
+                  onLayout={(event: LayoutChangeEvent) => {
+                    setParticipantPanelLayout(extractLayout(event));
+                  }}
+                >
                   {!activeEventId ? (
                     <>
                       <Text style={styles.participantPanelTitle}>Sélection de l'évènement</Text>
@@ -1772,7 +1940,12 @@ export default function App() {
               )}
 
               {currentUser.role === 'admin' && emergencyAlertsForAdmins.length > 0 && (
-                <View style={styles.adminEmergencyPanel}>
+                <View
+                  style={styles.adminEmergencyPanel}
+                  onLayout={(event: LayoutChangeEvent) => {
+                    setAdminEmergencyLayout(extractLayout(event));
+                  }}
+                >
                   <Text style={styles.adminEmergencyTitle}>Alertes urgences participants (appuie pour supprimer)</Text>
                   {emergencyAlertsForAdmins.map((alert) => (
                     <Pressable
@@ -1790,7 +1963,12 @@ export default function App() {
 
               {/* Légende */}
               {!isParticipantNavigationActive || navigationMode !== 'normal' ? (
-                <View style={styles.legend}>
+                <View
+                  style={styles.legend}
+                  onLayout={(event: LayoutChangeEvent) => {
+                    setLegendLayout(extractLayout(event));
+                  }}
+                >
                   <View style={styles.legendItem}>
                     <View style={[styles.legendColor, { backgroundColor: '#ff8c42' }]} />
                     <Text style={styles.legendText}>Participant</Text>
@@ -2656,11 +2834,13 @@ const styles = StyleSheet.create({
   recenterButton: {
     position: 'absolute',
     right: 16,
-    bottom: 28,
+    bottom: 132,
     borderRadius: 999,
     paddingHorizontal: 14,
     paddingVertical: 10,
     backgroundColor: 'rgba(15, 118, 110, 0.95)',
+    zIndex: 30,
+    elevation: 8,
   },
   recenterButtonText: {
     color: '#ffffff',
