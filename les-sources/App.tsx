@@ -1,12 +1,15 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
+import * as TaskManager from 'expo-task-manager';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
-import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
+import { activateKeepAwake, deactivateKeepAwake } from 'expo-keep-awake';
 import { StatusBar } from 'expo-status-bar';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   LayoutChangeEvent,
   Linking,
@@ -26,14 +29,22 @@ import {
   writeCloudValue,
 } from './firebase';
 
-type Role = 'admin' | 'benevole' | 'participant';
-type Page = 'admin' | 'carte' | 'compte';
+type Role = 'admin' | 'admin_global' | 'admin_manifestation' | 'benevole' | 'participant';
+type Page = 'manifestations' | 'admin' | 'carte' | 'compte';
+
+type Manifestation = {
+  id: string;
+  name: string;
+  createdAt: number;
+};
 
 type User = {
   id: string;
   username: string;
   password: string;
   role: Role;
+  manifestationId?: string;
+  preferredMapType?: MapType;
 };
 
 type UserLocation = {
@@ -44,6 +55,7 @@ type UserLocation = {
   heading?: number;
   isFollowingEvent?: boolean;
   followingEventId?: string;
+  manifestationId: string;
   timestamp: number;
 };
 
@@ -54,6 +66,7 @@ type EventTrackPoint = {
 
 type EventItem = {
   id: string;
+  manifestationId: string;
   name: string;
   date: string;
   startTime: string;
@@ -68,28 +81,75 @@ type VisibleEvent = {
   points: EventTrackPoint[];
 };
 
-type EventPickerTarget = 'date' | 'startTime' | 'endTime' | null;
-type NavigationMode = 'normal' | 'focus';
+type EventPickerTarget = 'date' | null;
+type MapType = 'standard' | 'satellite' | 'hybrid';
+type NavigationMode = 'normal';
+
+type TrackingSession = {
+  userId: string;
+  username: string;
+  role: Role;
+  manifestationId: string;
+  activeEventId?: string | null;
+};
+
+type AppDataCache = {
+  manifestations: Manifestation[];
+  users: User[];
+  userLocations: UserLocation[];
+  events: EventItem[];
+  emergencyAlerts: EmergencyAlert[];
+};
+
+type SavedAuthSession = {
+  userId: string;
+  manifestationId: string | null;
+  page: Page;
+  savedAt: number;
+};
 
 type EmergencyAlert = {
   id: string;
   userId: string;
   username: string;
+  manifestationId: string;
   eventId: string;
   eventName: string;
   timestamp: number;
 };
 
 const CLOUD_USERS_PATH = 'users';
+const CLOUD_MANIFESTATIONS_PATH = 'manifestations';
 const CLOUD_LOCATIONS_PATH = 'locations';
 const CLOUD_EVENTS_PATH = 'events';
 const CLOUD_EMERGENCY_ALERTS_PATH = 'emergencyAlerts';
+const BACKGROUND_LOCATION_TASK_NAME = 'les-sources-background-location';
+const TRACKING_SESSION_STORAGE_KEY = '@les-sources/tracking-session';
+const APP_DATA_CACHE_STORAGE_KEY = '@les-sources/app-data-cache';
+const AUTH_SESSION_STORAGE_KEY = '@les-sources/auth-session';
+const DEFAULT_MANIFESTATION_ID = 'manifestation-1';
+const DEFAULT_MANIFESTATIONS: Manifestation[] = [
+  {
+    id: DEFAULT_MANIFESTATION_ID,
+    name: 'Manifestation principale',
+    createdAt: Date.now(),
+  },
+];
 const MENDE_REGION = {
   latitude: 44.5186,
   longitude: 3.5017,
 };
 
-const mapsModule = Platform.OS === 'web' ? null : require('react-native-maps');
+const mapsModule =
+  Platform.OS === 'web'
+    ? null
+    : (() => {
+        try {
+          return require('react-native-maps');
+        } catch {
+          return null;
+        }
+      })();
 const MapView = mapsModule?.default;
 const Marker = mapsModule?.Marker;
 const Polyline = mapsModule?.Polyline;
@@ -101,6 +161,7 @@ const DEFAULT_USERS: User[] = [
     username: 'admin',
     password: 'admin',
     role: 'admin',
+    manifestationId: DEFAULT_MANIFESTATION_ID,
   },
 ];
 
@@ -111,7 +172,7 @@ const DEFAULT_MAP_REGION = {
   longitudeDelta: 0.0421,
 };
 
-const EVENT_COLORS = ['#ef4444', '#2563eb', '#f59e0b', '#10b981', '#8b5cf6'];
+const EVENT_COLORS = ['#ef4444', '#2563eb', '#f59e0b', '#A7C7E7', '#8b5cf6'];
 const EARTH_RADIUS_METERS = 6371000;
 
 const formatTime = (date: Date) => {
@@ -233,6 +294,13 @@ const routeLengthMeters = (points: EventTrackPoint[]) => {
 
 const formatKm = (distanceMeters: number) => `${(distanceMeters / 1000).toFixed(2)} km`;
 
+const formatElapsedTime = (seconds: number) => {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+};
+
 const getDirectionArrow = (degrees: number) => {
   const normalized = normalizeDegrees(degrees);
   if (normalized < 22.5 || normalized >= 337.5) return '↑';
@@ -278,6 +346,131 @@ const mapLocationsByUserId = (items: UserLocation[]) => {
   }, {});
 };
 
+const persistBackgroundLocation = async (
+  session: TrackingSession,
+  latitude: number,
+  longitude: number,
+  heading?: number,
+  followingEventId?: string
+) => {
+  const cloudLocations = await readCloudValue<Record<string, UserLocation>>(CLOUD_LOCATIONS_PATH);
+  const existingLocations = valuesFromRecord<UserLocation>(cloudLocations);
+  const existingIndex = existingLocations.findIndex((location) => location.userId === session.userId);
+
+  const nextLocation: UserLocation = {
+    userId: session.userId,
+    username: session.username,
+    latitude,
+    longitude,
+    heading,
+    isFollowingEvent: Boolean(followingEventId),
+    followingEventId,
+    manifestationId: session.manifestationId || DEFAULT_MANIFESTATION_ID,
+    timestamp: Date.now(),
+  };
+
+  const nextLocations = [...existingLocations];
+  if (existingIndex >= 0) {
+    nextLocations[existingIndex] = nextLocation;
+  } else {
+    nextLocations.push(nextLocation);
+  }
+
+  await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations));
+};
+
+if (Platform.OS !== 'web') {
+  TaskManager.defineTask(
+    BACKGROUND_LOCATION_TASK_NAME,
+    async (taskData) => {
+      const { data, error } = taskData as {
+        data?: { locations?: Location.LocationObject[] };
+        error: TaskManager.TaskManagerError | null;
+      };
+
+    if (error) {
+      console.error('Erreur localisation arrière-plan:', error);
+      return;
+    }
+
+    const locations = (data as { locations?: Location.LocationObject[] } | undefined)?.locations;
+    if (!locations?.length) {
+      return;
+    }
+
+    try {
+      const sessionRaw = await AsyncStorage.getItem(TRACKING_SESSION_STORAGE_KEY);
+      if (!sessionRaw) {
+        return;
+      }
+
+      const session = JSON.parse(sessionRaw) as TrackingSession;
+      const latestLocation = locations[locations.length - 1];
+      const heading =
+        typeof latestLocation.coords.heading === 'number' && latestLocation.coords.heading >= 0
+          ? latestLocation.coords.heading
+          : undefined;
+
+      await persistBackgroundLocation(
+        session,
+        latestLocation.coords.latitude,
+        latestLocation.coords.longitude,
+        heading,
+        session.role === 'participant' ? session.activeEventId ?? undefined : undefined
+      );
+    } catch (taskError) {
+      console.error('Erreur mise à jour position arrière-plan:', taskError);
+    }
+    }
+  );
+}
+
+const normalizeRole = (role: string | undefined): Role => {
+  if (role === 'admin_global' || role === 'admin_manifestation' || role === 'benevole' || role === 'participant') {
+    return role;
+  }
+
+  return 'admin';
+};
+
+const isGlobalAdminRole = (role: Role) => role === 'admin' || role === 'admin_global';
+
+const isManifestationAdminRole = (role: Role) => role === 'admin' || role === 'admin_manifestation';
+
+const getRoleLabel = (role: Role) => {
+  switch (role) {
+    case 'admin':
+    case 'admin_global':
+      return 'admin global';
+    case 'admin_manifestation':
+      return 'admin manifestation';
+    case 'benevole':
+      return 'bénévole';
+    case 'participant':
+      return 'participant';
+    default:
+      return role;
+  }
+};
+
+const normalizeManifestationName = (value: string) => value.trim().replace(/\s+/g, ' ');
+
+const defaultManifestation = (): Manifestation => ({
+  id: DEFAULT_MANIFESTATION_ID,
+  name: 'Manifestation principale',
+  createdAt: Date.now(),
+});
+
+const normalizeUser = (user: User): User => ({
+  ...user,
+  role: normalizeRole(user.role),
+});
+
+const assignDefaultManifestation = <T extends { manifestationId?: string }>(item: T) => ({
+  ...item,
+  manifestationId: item.manifestationId ?? DEFAULT_MANIFESTATION_ID,
+});
+
 const parseGpxTrackPoints = (gpxText: string): EventTrackPoint[] => {
   const points: EventTrackPoint[] = [];
   const trackPointPattern = /<trkpt\b[^>]*\blat="([^"]+)"[^>]*\blon="([^"]+)"[^>]*>/gi;
@@ -303,18 +496,97 @@ const isEventVisibleForUser = (event: EventItem, role: Role) => {
   }
 
   if (event.showForVolunteers) {
-    return role === 'admin' || role === 'benevole';
+    return isManifestationAdminRole(role) || role === 'benevole';
   }
 
   return false;
 };
 
+const normalizeStoredAppData = (rawValue: string | null): AppDataCache | null => {
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as Partial<AppDataCache>;
+
+    return {
+      manifestations: Array.isArray(parsed.manifestations)
+        ? parsed.manifestations.map((manifestation) => ({
+            ...manifestation,
+            name: normalizeManifestationName(String(manifestation.name ?? '')) || 'Manifestation sans nom',
+          }))
+        : [],
+      users: Array.isArray(parsed.users) ? parsed.users.map(normalizeUser) : [],
+      userLocations: Array.isArray(parsed.userLocations) ? parsed.userLocations.map(assignDefaultManifestation) : [],
+      events: Array.isArray(parsed.events) ? parsed.events.map(assignDefaultManifestation) : [],
+      emergencyAlerts: Array.isArray(parsed.emergencyAlerts)
+        ? parsed.emergencyAlerts.map(assignDefaultManifestation)
+        : [],
+    };
+  } catch {
+    return null;
+  }
+};
+
+const normalizeSavedAuthSession = (rawValue: string | null): SavedAuthSession | null => {
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as Partial<SavedAuthSession>;
+
+    if (typeof parsed.userId !== 'string' || !parsed.userId) {
+      return null;
+    }
+
+    const page = parsed.page;
+    const normalizedPage: Page =
+      page === 'manifestations' || page === 'admin' || page === 'carte' || page === 'compte'
+        ? page
+        : 'carte';
+
+    return {
+      userId: parsed.userId,
+      manifestationId: typeof parsed.manifestationId === 'string' ? parsed.manifestationId : null,
+      page: normalizedPage,
+      savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+};
+
+const persistAppDataCache = async (cache: AppDataCache) => {
+  try {
+    await AsyncStorage.setItem(APP_DATA_CACHE_STORAGE_KEY, JSON.stringify(cache));
+  } catch (error) {
+    console.error('Erreur sauvegarde cache local:', error);
+  }
+};
+
+const persistAuthSession = async (session: SavedAuthSession | null) => {
+  try {
+    if (!session) {
+      await AsyncStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+      return;
+    }
+
+    await AsyncStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch (error) {
+    console.error('Erreur sauvegarde session locale:', error);
+  }
+};
+
 export default function App() {
   const useCloudSync = cloudSyncEnabled;
+  const [manifestations, setManifestations] = useState<Manifestation[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [currentPage, setCurrentPage] = useState<Page>('carte');
+  const [currentManifestationId, setCurrentManifestationId] = useState<string | null>(null);
 
   const [loginUsername, setLoginUsername] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
@@ -323,22 +595,23 @@ export default function App() {
   const [newPassword, setNewPassword] = useState('');
   const [newRole, setNewRole] = useState<Role>('participant');
 
+  const [manifestationName, setManifestationName] = useState('');
+
   const [userLocations, setUserLocations] = useState<UserLocation[]>([]);
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
   const [events, setEvents] = useState<EventItem[]>([]);
 
   const [eventName, setEventName] = useState('');
   const [eventDate, setEventDate] = useState('');
-  const [eventStartTime, setEventStartTime] = useState('');
-  const [eventEndTime, setEventEndTime] = useState('');
   const [eventGpxText, setEventGpxText] = useState('');
   const [eventGpxFileName, setEventGpxFileName] = useState('');
   const [eventVisibleForVolunteers, setEventVisibleForVolunteers] = useState(false);
   const [eventDateValue, setEventDateValue] = useState<Date | null>(null);
-  const [eventStartTimeValue, setEventStartTimeValue] = useState<Date | null>(null);
-  const [eventEndTimeValue, setEventEndTimeValue] = useState<Date | null>(null);
   const [eventPickerTarget, setEventPickerTarget] = useState<EventPickerTarget>(null);
   const [eventPickerValue, setEventPickerValue] = useState(new Date());
+
+  const [mapType, setMapType] = useState<MapType>('standard');
+  const [accountMapType, setAccountMapType] = useState<MapType>('standard');
 
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
@@ -352,11 +625,14 @@ export default function App() {
   const [showOffRouteAlert, setShowOffRouteAlert] = useState(false);
   const [emergencyAlerts, setEmergencyAlerts] = useState<EmergencyAlert[]>([]);
   const [emergencyCountdown, setEmergencyCountdown] = useState<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [mapContainerHeight, setMapContainerHeight] = useState(0);
   const [mapNoticeLayout, setMapNoticeLayout] = useState<{ y: number; height: number } | null>(null);
   const [adminEmergencyLayout, setAdminEmergencyLayout] = useState<{ y: number; height: number } | null>(null);
-  const [legendLayout, setLegendLayout] = useState<{ y: number; height: number } | null>(null);
   const [participantPanelLayout, setParticipantPanelLayout] = useState<{ y: number; height: number } | null>(null);
+  const [navigationStatsLayout, setNavigationStatsLayout] = useState<{ y: number; height: number } | null>(null);
+  const [isOffline, setIsOffline] = useState(false);
+  const [lastKnownUserLocations, setLastKnownUserLocations] = useState<UserLocation[]>([]);
 
   const mapRef = useRef<any>(null);
   const previousNavigationPositionRef = useRef<{ latitude: number; longitude: number } | null>(null);
@@ -369,17 +645,62 @@ export default function App() {
   const [accountUsername, setAccountUsername] = useState('');
   const [accountPassword, setAccountPassword] = useState('');
 
-  useEffect(() => {
-    if (!useCloudSync) {
-      setIsReady(true);
+  const restoreSavedSession = (session: SavedAuthSession | null, nextUsers: User[]) => {
+    if (!session) {
       return;
     }
 
+    const restoredUser = nextUsers.find((user) => user.id === session.userId);
+    if (!restoredUser) {
+      return;
+    }
+
+    setCurrentUser(restoredUser);
+    setCurrentPage(session.page ?? (isGlobalAdminRole(restoredUser.role) ? 'manifestations' : 'carte'));
+    setCurrentManifestationId(session.manifestationId ?? restoredUser.manifestationId ?? DEFAULT_MANIFESTATION_ID);
+  };
+
+  useEffect(() => {
     let isMounted = true;
+    let savedSession: SavedAuthSession | null = null;
+
+    const applyLoadedData = async (loadedData: AppDataCache, source: 'cache' | 'cloud') => {
+      const nextManifestations = loadedData.manifestations.length > 0 ? loadedData.manifestations : DEFAULT_MANIFESTATIONS;
+      const nextUsers = loadedData.users.length > 0 ? loadedData.users : DEFAULT_USERS;
+      const nextLocations = loadedData.userLocations;
+      const nextEvents = loadedData.events;
+      const nextAlerts = [...loadedData.emergencyAlerts]
+        .sort((left, right) => right.timestamp - left.timestamp)
+        .slice(0, 50);
+
+      if (!isMounted) {
+        return nextUsers;
+      }
+
+      setManifestations(nextManifestations);
+      setUsers(nextUsers);
+      setUserLocations(nextLocations);
+      setLastKnownUserLocations(nextLocations);
+      setEvents(nextEvents);
+      setEmergencyAlerts(nextAlerts);
+
+      if (source === 'cloud') {
+        await persistAppDataCache({
+          manifestations: nextManifestations,
+          users: nextUsers,
+          userLocations: nextLocations,
+          events: nextEvents,
+          emergencyAlerts: nextAlerts,
+        });
+      }
+
+      return nextUsers;
+    };
 
     const syncFromCloud = async () => {
       try {
-        const [cloudUsers, cloudLocations, cloudEvents, cloudAlerts] = await Promise.all([
+        const [cloudManifestations, cloudUsers, cloudLocations, cloudEvents, cloudAlerts] = await Promise.all([
+          readCloudValue<Record<string, Manifestation>>(CLOUD_MANIFESTATIONS_PATH),
           readCloudValue<Record<string, User>>(CLOUD_USERS_PATH),
           readCloudValue<Record<string, UserLocation>>(CLOUD_LOCATIONS_PATH),
           readCloudValue<Record<string, EventItem>>(CLOUD_EVENTS_PATH),
@@ -390,24 +711,122 @@ export default function App() {
           return;
         }
 
-        const parsedUsers = valuesFromRecord<User>(cloudUsers);
-        const hasAdmin = parsedUsers.some((user: User) => user.username === 'admin' && user.role === 'admin');
-        const nextUsers = parsedUsers.length === 0 ? DEFAULT_USERS : hasAdmin ? parsedUsers : [...parsedUsers, ...DEFAULT_USERS];
-
-        if (parsedUsers.length === 0 || !hasAdmin) {
-          await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
+        const parsedManifestations = valuesFromRecord<Manifestation>(cloudManifestations).map((item) => ({
+          ...item,
+          name: normalizeManifestationName(item.name) || 'Manifestation sans nom',
+        }));
+        const nextManifestations = parsedManifestations.length > 0 ? parsedManifestations : DEFAULT_MANIFESTATIONS;
+        if (parsedManifestations.length === 0) {
+          await writeCloudValue(CLOUD_MANIFESTATIONS_PATH, mapById(nextManifestations));
         }
 
-        setUsers(nextUsers);
-        setUserLocations(valuesFromRecord<UserLocation>(cloudLocations));
-        setEvents(valuesFromRecord<EventItem>(cloudEvents));
-        setEmergencyAlerts(
-          valuesFromRecord<EmergencyAlert>(cloudAlerts)
-            .sort((left, right) => right.timestamp - left.timestamp)
-            .slice(0, 50)
+        const parsedUsers = valuesFromRecord<User>(cloudUsers).map(normalizeUser);
+        const hasAdmin = parsedUsers.some((user: User) => user.username === 'admin' && user.role === 'admin');
+        const nextUsers =
+          parsedUsers.length === 0
+            ? DEFAULT_USERS
+            : hasAdmin
+              ? parsedUsers.map((user) =>
+                  user.role === 'admin' && !user.manifestationId
+                    ? { ...user, manifestationId: DEFAULT_MANIFESTATION_ID }
+                    : user
+                )
+              : [...parsedUsers, ...DEFAULT_USERS];
+
+        const normalizedUsers = nextUsers.map((user) =>
+          isGlobalAdminRole(user.role) && user.role !== 'admin'
+            ? user
+            : assignDefaultManifestation(user)
         );
+
+        if (parsedUsers.length === 0 || !hasAdmin || normalizedUsers.some((user) => !isGlobalAdminRole(user.role) && !user.manifestationId)) {
+          await writeCloudValue(CLOUD_USERS_PATH, mapById(normalizedUsers));
+        }
+
+        const parsedLocations = valuesFromRecord<UserLocation>(cloudLocations).map(assignDefaultManifestation);
+        const parsedEvents = valuesFromRecord<EventItem>(cloudEvents).map(assignDefaultManifestation);
+        const parsedAlerts = valuesFromRecord<EmergencyAlert>(cloudAlerts).map(assignDefaultManifestation);
+
+        const hasLegacyLocations = parsedLocations.some((location) => !location.manifestationId);
+        const hasLegacyEvents = parsedEvents.some((event) => !event.manifestationId);
+        const hasLegacyAlerts = parsedAlerts.some((alert) => !alert.manifestationId);
+
+        if (hasLegacyLocations) {
+          await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(parsedLocations));
+        }
+        if (hasLegacyEvents) {
+          await writeCloudValue(CLOUD_EVENTS_PATH, mapById(parsedEvents));
+        }
+        if (hasLegacyAlerts) {
+          await writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(parsedAlerts));
+        }
+
+        const nextAlerts = [...parsedAlerts].sort((left, right) => right.timestamp - left.timestamp).slice(0, 50);
+
+        if (!isMounted) {
+          return;
+        }
+
+        setManifestations(nextManifestations);
+        setUsers(normalizedUsers);
+        setUserLocations(parsedLocations);
+        setLastKnownUserLocations(parsedLocations);
+        setEvents(parsedEvents);
+        setEmergencyAlerts(nextAlerts);
+
+        await persistAppDataCache({
+          manifestations: nextManifestations,
+          users: normalizedUsers,
+          userLocations: parsedLocations,
+          events: parsedEvents,
+          emergencyAlerts: nextAlerts,
+        });
+
+        if (savedSession) {
+          const restoredUser = normalizedUsers.find((user) => user.id === savedSession?.userId);
+          if (restoredUser) {
+            setCurrentUser(restoredUser);
+            setCurrentPage(savedSession.page ?? (isGlobalAdminRole(restoredUser.role) ? 'manifestations' : 'carte'));
+            setCurrentManifestationId(savedSession.manifestationId ?? restoredUser.manifestationId ?? DEFAULT_MANIFESTATION_ID);
+          } else {
+            setCurrentUser(null);
+            setCurrentManifestationId(null);
+            await persistAuthSession(null);
+          }
+        }
+
+        setIsOffline(false);
       } catch {
         // Ignore cloud sync errors and keep the last good state.
+        setIsOffline(true);
+      }
+    };
+
+    const bootstrap = async () => {
+      try {
+        const [storedDataRaw, storedSessionRaw] = await Promise.all([
+          AsyncStorage.getItem(APP_DATA_CACHE_STORAGE_KEY),
+          AsyncStorage.getItem(AUTH_SESSION_STORAGE_KEY),
+        ]);
+
+        savedSession = normalizeSavedAuthSession(storedSessionRaw);
+
+        const cachedData = normalizeStoredAppData(storedDataRaw) ?? {
+          manifestations: DEFAULT_MANIFESTATIONS,
+          users: DEFAULT_USERS,
+          userLocations: [],
+          events: [],
+          emergencyAlerts: [],
+        };
+
+        const nextUsers = await applyLoadedData(cachedData, 'cache');
+        restoreSavedSession(savedSession, nextUsers);
+
+        if (useCloudSync) {
+          await syncFromCloud();
+        }
+      } catch {
+        setIsOffline(true);
       } finally {
         if (isMounted) {
           setIsReady(true);
@@ -415,12 +834,14 @@ export default function App() {
       }
     };
 
-    syncFromCloud();
-    const syncInterval = setInterval(syncFromCloud, 2000);
+    bootstrap();
+    const syncInterval = useCloudSync ? setInterval(syncFromCloud, 2000) : undefined;
 
     return () => {
       isMounted = false;
-      clearInterval(syncInterval);
+      if (syncInterval) {
+        clearInterval(syncInterval);
+      }
     };
   }, [useCloudSync]);
 
@@ -428,56 +849,333 @@ export default function App() {
     if (!currentUser) {
       setAccountUsername('');
       setAccountPassword('');
+      setAccountMapType('standard');
+      setMapType('standard');
+      setCurrentManifestationId(null);
       return;
     }
 
     setAccountUsername(currentUser.username);
     setAccountPassword(currentUser.password);
+    setAccountMapType(currentUser.preferredMapType ?? 'standard');
+    setMapType(currentUser.preferredMapType ?? 'standard');
+    if (!isGlobalAdminRole(currentUser.role)) {
+      setCurrentManifestationId(currentUser.manifestationId ?? DEFAULT_MANIFESTATION_ID);
+    }
   }, [currentUser]);
 
+  useEffect(() => {
+    if (!currentManifestationId && currentUser && !isGlobalAdminRole(currentUser.role)) {
+      setCurrentManifestationId(currentUser.manifestationId ?? DEFAULT_MANIFESTATION_ID);
+    }
+  }, [currentManifestationId, currentUser]);
+
+  useEffect(() => {
+    setSelectedEventId(null);
+    setActiveEventId(null);
+    setNavigationMode('normal');
+    setNextWaypointIndex(0);
+    setDistanceTravelledMeters(0);
+    setNavigationStartedAt(null);
+    setCurrentSpeedKmh(0);
+    setOffRouteDistanceMeters(0);
+    setShowOffRouteAlert(false);
+    setEmergencyCountdown(null);
+    previousNavigationPositionRef.current = null;
+  }, [currentManifestationId]);
+
+  const canViewGlobalAdmins = currentUser ? isGlobalAdminRole(currentUser.role) : false;
+
   const sortedUsers = useMemo(() => {
-    return [...users].sort((a, b) => {
+    const visibleUsers = currentManifestationId
+      ? users.filter(
+          (user) =>
+            user.manifestationId === currentManifestationId &&
+            (canViewGlobalAdmins || !isGlobalAdminRole(user.role))
+        )
+      : users.filter((user) => isGlobalAdminRole(user.role));
+
+    return [...visibleUsers].sort((a, b) => {
       if (a.role !== b.role) {
-        return a.role === 'admin' ? -1 : 1;
+        return isGlobalAdminRole(a.role) ? -1 : 1;
       }
       return a.username.localeCompare(b.username);
     });
-  }, [users]);
+  }, [canViewGlobalAdmins, currentManifestationId, users]);
+
+  const currentManifestation = useMemo(() => {
+    if (!currentManifestationId) {
+      return null;
+    }
+
+    return manifestations.find((manifestation) => manifestation.id === currentManifestationId) ?? null;
+  }, [currentManifestationId, manifestations]);
+
+  const currentManifestationUsers = useMemo(() => {
+    if (!currentManifestationId) {
+      return [] as User[];
+    }
+
+    return users.filter(
+      (user) => user.manifestationId === currentManifestationId && (canViewGlobalAdmins || !isGlobalAdminRole(user.role))
+    );
+  }, [canViewGlobalAdmins, currentManifestationId, users]);
+
+  const currentManifestationEvents = useMemo(() => {
+    if (!currentManifestationId) {
+      return [] as EventItem[];
+    }
+
+    return events.filter((event) => event.manifestationId === currentManifestationId);
+  }, [currentManifestationId, events]);
+
+  const currentManifestationLocations = useMemo(() => {
+    if (!currentManifestationId) {
+      return [] as UserLocation[];
+    }
+
+    return userLocations.filter((location) => location.manifestationId === currentManifestationId);
+  }, [currentManifestationId, userLocations]);
+
+  const currentManifestationAlerts = useMemo(() => {
+    if (!currentManifestationId) {
+      return [] as EmergencyAlert[];
+    }
+
+    return emergencyAlerts.filter((alert) => alert.manifestationId === currentManifestationId);
+  }, [currentManifestationId, emergencyAlerts]);
+
+  const currentManifestationCount = manifestations.length;
 
   const persistUsers = async (nextUsers: User[]) => {
     setUsers(nextUsers);
-    if (!useCloudSync) {
-      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
+    await persistAppDataCache({
+      manifestations,
+      users: nextUsers,
+      userLocations,
+      events,
+      emergencyAlerts,
+    });
+
+    if (!useCloudSync || isOffline) {
+      return;
     }
 
-    await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
+    try {
+      await writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers));
+      setIsOffline(false);
+    } catch {
+      setIsOffline(true);
+    }
   };
 
   const persistEvents = async (nextEvents: EventItem[]) => {
     setEvents(nextEvents);
-    if (!useCloudSync) {
-      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
+    await persistAppDataCache({
+      manifestations,
+      users,
+      userLocations,
+      events: nextEvents,
+      emergencyAlerts,
+    });
+
+    if (!useCloudSync || isOffline) {
+      return;
     }
 
-    await writeCloudValue(CLOUD_EVENTS_PATH, mapById(nextEvents));
+    try {
+      await writeCloudValue(CLOUD_EVENTS_PATH, mapById(nextEvents));
+      setIsOffline(false);
+    } catch {
+      setIsOffline(true);
+    }
   };
 
   const persistEmergencyAlerts = async (nextAlerts: EmergencyAlert[]) => {
     setEmergencyAlerts(nextAlerts);
-    if (!useCloudSync) {
-      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
+    await persistAppDataCache({
+      manifestations,
+      users,
+      userLocations,
+      events,
+      emergencyAlerts: nextAlerts,
+    });
+
+    if (!useCloudSync || isOffline) {
+      return;
     }
 
-    await writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(nextAlerts));
+    try {
+      await writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(nextAlerts));
+      setIsOffline(false);
+    } catch {
+      setIsOffline(true);
+    }
   };
 
   const persistUserLocations = async (nextLocations: UserLocation[]) => {
     setUserLocations(nextLocations);
-    if (!useCloudSync) {
-      throw new Error('La synchronisation cloud est obligatoire. Configure databaseURL dans app.json.');
+    setLastKnownUserLocations(nextLocations);
+    await persistAppDataCache({
+      manifestations,
+      users,
+      userLocations: nextLocations,
+      events,
+      emergencyAlerts,
+    });
+
+    if (!useCloudSync || isOffline) {
+      return;
     }
 
-    await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations));
+    try {
+      await writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations));
+      setIsOffline(false);
+    } catch {
+      setIsOffline(true);
+    }
+  };
+
+  const persistManifestations = async (nextManifestations: Manifestation[]) => {
+    setManifestations(nextManifestations);
+    await persistAppDataCache({
+      manifestations: nextManifestations,
+      users,
+      userLocations,
+      events,
+      emergencyAlerts,
+    });
+
+    if (!useCloudSync || isOffline) {
+      return;
+    }
+
+    try {
+      await writeCloudValue(CLOUD_MANIFESTATIONS_PATH, mapById(nextManifestations));
+      setIsOffline(false);
+    } catch {
+      setIsOffline(true);
+    }
+  };
+
+  const handleCreateManifestation = async () => {
+    const name = normalizeManifestationName(manifestationName);
+    if (!name) {
+      Alert.alert('Erreur', 'Le nom de la manifestation est obligatoire.');
+      return;
+    }
+
+    const nextManifestation: Manifestation = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      createdAt: Date.now(),
+    };
+
+    await persistManifestations([...manifestations, nextManifestation]);
+    setManifestationName('');
+    setCurrentManifestationId(nextManifestation.id);
+    setCurrentPage('carte');
+  };
+
+  const handleSelectManifestation = (manifestationId: string) => {
+    setCurrentManifestationId(manifestationId);
+    setCurrentPage('carte');
+  };
+
+  const handleDeleteManifestation = (manifestationId: string) => {
+    if (manifestations.length <= 1) {
+      Alert.alert('Action impossible', 'Au moins une manifestation doit rester disponible.');
+      return;
+    }
+
+    const targetManifestation = manifestations.find((manifestation) => manifestation.id === manifestationId);
+    if (!targetManifestation) {
+      return;
+    }
+
+    Alert.alert(
+      'Supprimer la manifestation',
+      `Supprimer "${targetManifestation.name}" effacera aussi ses comptes, évènements, positions et alertes associés.`,
+      [
+        { text: 'Annuler', style: 'cancel' },
+        {
+          text: 'Supprimer',
+          style: 'destructive',
+          onPress: async () => {
+            const isDeletingCurrentUser = Boolean(
+              currentUser &&
+              currentUser.manifestationId === manifestationId &&
+              !isGlobalAdminRole(currentUser.role)
+            );
+
+            const nextManifestations = manifestations.filter((manifestation) => manifestation.id !== manifestationId);
+            const nextUsers = users
+              .map((user) => {
+                if (user.manifestationId !== manifestationId) {
+                  return user;
+                }
+
+                return isGlobalAdminRole(user.role) ? { ...user, manifestationId: undefined } : null;
+              })
+              .filter((user): user is User => user !== null);
+            const nextEvents = events.filter((event) => event.manifestationId !== manifestationId);
+            const nextLocations = userLocations.filter((location) => location.manifestationId !== manifestationId);
+            const nextAlerts = emergencyAlerts.filter((alert) => alert.manifestationId !== manifestationId);
+
+            await persistAppDataCache({
+              manifestations: nextManifestations,
+              users: nextUsers,
+              userLocations: nextLocations,
+              events: nextEvents,
+              emergencyAlerts: nextAlerts,
+            });
+
+            setManifestations(nextManifestations);
+            setUsers(nextUsers);
+            setUserLocations(nextLocations);
+            setLastKnownUserLocations(nextLocations);
+            setEvents(nextEvents);
+            setEmergencyAlerts(nextAlerts);
+
+            if (useCloudSync && !isOffline) {
+              try {
+                await Promise.all([
+                  writeCloudValue(CLOUD_MANIFESTATIONS_PATH, mapById(nextManifestations)),
+                  writeCloudValue(CLOUD_USERS_PATH, mapById(nextUsers)),
+                  writeCloudValue(CLOUD_EVENTS_PATH, mapById(nextEvents)),
+                  writeCloudValue(CLOUD_LOCATIONS_PATH, mapLocationsByUserId(nextLocations)),
+                  writeCloudValue(CLOUD_EMERGENCY_ALERTS_PATH, mapById(nextAlerts)),
+                ]);
+                setIsOffline(false);
+              } catch {
+                setIsOffline(true);
+              }
+            }
+
+            if (currentUser && currentUser.manifestationId === manifestationId) {
+              if (isGlobalAdminRole(currentUser.role)) {
+                const detachedUser = { ...currentUser, manifestationId: undefined };
+                const nextSelectedManifestation =
+                  currentManifestationId === manifestationId ? nextManifestations[0]?.id ?? null : currentManifestationId;
+                setCurrentUser(detachedUser);
+                await persistAuthSession({
+                  userId: detachedUser.id,
+                  manifestationId: nextSelectedManifestation,
+                  page: currentPage,
+                  savedAt: Date.now(),
+                });
+              } else {
+                handleLogout();
+              }
+            }
+
+            if (!isDeletingCurrentUser && currentManifestationId === manifestationId) {
+              setCurrentManifestationId(nextManifestations[0]?.id ?? null);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const handlePickGpxFile = async () => {
@@ -517,16 +1215,6 @@ export default function App() {
     setEventPickerValue(eventDateValue ?? new Date());
   };
 
-  const openEventStartTimePicker = () => {
-    setEventPickerTarget('startTime');
-    setEventPickerValue(eventStartTimeValue ?? new Date());
-  };
-
-  const openEventEndTimePicker = () => {
-    setEventPickerTarget('endTime');
-    setEventPickerValue(eventEndTimeValue ?? new Date());
-  };
-
   const handleEventPickerChange = (pickerEvent: DateTimePickerEvent, selectedValue?: Date) => {
     if (pickerEvent.type === 'dismissed' || !selectedValue) {
       setEventPickerTarget(null);
@@ -536,32 +1224,6 @@ export default function App() {
     if (eventPickerTarget === 'date') {
       setEventDateValue(selectedValue);
       setEventDate(getLocalDateKey(selectedValue));
-
-      if (eventStartTimeValue) {
-        const mergedStart = mergeDateAndTime(selectedValue, eventStartTimeValue);
-        setEventStartTimeValue(mergedStart);
-        setEventStartTime(formatTime(mergedStart));
-      }
-
-      if (eventEndTimeValue) {
-        const mergedEnd = mergeDateAndTime(selectedValue, eventEndTimeValue);
-        setEventEndTimeValue(mergedEnd);
-        setEventEndTime(formatTime(mergedEnd));
-      }
-    }
-
-    if (eventPickerTarget === 'startTime') {
-      const baseDate = eventDateValue ?? new Date();
-      const mergedStart = mergeDateAndTime(baseDate, selectedValue);
-      setEventStartTimeValue(mergedStart);
-      setEventStartTime(formatTime(mergedStart));
-    }
-
-    if (eventPickerTarget === 'endTime') {
-      const baseDate = eventDateValue ?? new Date();
-      const mergedEnd = mergeDateAndTime(baseDate, selectedValue);
-      setEventEndTimeValue(mergedEnd);
-      setEventEndTime(formatTime(mergedEnd));
     }
 
     setEventPickerTarget(null);
@@ -575,6 +1237,7 @@ export default function App() {
     heading?: number,
     followingEventId?: string
   ) => {
+    const manifestationId = currentManifestationId ?? DEFAULT_MANIFESTATION_ID;
     const existingIndex = userLocations.findIndex((loc: UserLocation) => loc.userId === userId);
     const newLocation: UserLocation = {
       userId,
@@ -584,6 +1247,7 @@ export default function App() {
       heading,
       isFollowingEvent: Boolean(followingEventId),
       followingEventId,
+      manifestationId,
       timestamp: Date.now(),
     };
 
@@ -595,7 +1259,15 @@ export default function App() {
       updatedLocations = [...userLocations, newLocation];
     }
 
-    await persistUserLocations(updatedLocations);
+    try {
+      await persistUserLocations(updatedLocations);
+      setIsOffline(false);
+      setLastKnownUserLocations(updatedLocations);
+    } catch (error) {
+      setIsOffline(true);
+      setUserLocations(updatedLocations);
+      setLastKnownUserLocations(updatedLocations);
+    }
   };
 
   const generateMockLocation = (previousLocation?: { latitude: number; longitude: number } | null) => {
@@ -681,28 +1353,26 @@ export default function App() {
   const getMarkerColorByRole = (role: Role) => {
     if (role === 'participant') return '#ff8c42'; // Orange
     if (role === 'benevole') return '#4b7bff'; // Bleu
-    return '#0f766e'; // Vert pour admin
+    return '#5F8FC9'; // Bleu pour admin
   };
 
   const handleCreateEvent = async () => {
+    if (!currentManifestationId) {
+      Alert.alert('Erreur', 'Sélectionne d abord une manifestation.');
+      return;
+    }
+
     const name = eventName.trim();
     const date = eventDate.trim();
-    const startTime = eventStartTime.trim();
-    const endTime = eventEndTime.trim();
     const gpxText = eventGpxText.trim();
 
-    if (!name || !date || !startTime || !endTime || !gpxText) {
-      Alert.alert('Erreur', 'Tous les champs de l evenement sont obligatoires.');
+    if (!name || !date || !gpxText) {
+      Alert.alert('Erreur', 'Tous les champs de l évènement sont obligatoires.');
       return;
     }
 
     if (!isValidDateInput(date)) {
       Alert.alert('Erreur', 'La date doit etre au format YYYY-MM-DD.');
-      return;
-    }
-
-    if (!isValidTimeInput(startTime) || !isValidTimeInput(endTime)) {
-      Alert.alert('Erreur', 'Les heures doivent etre au format HH:MM.');
       return;
     }
 
@@ -714,10 +1384,11 @@ export default function App() {
 
     const nextEvent: EventItem = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      manifestationId: currentManifestationId,
       name,
       date,
-      startTime,
-      endTime,
+      startTime: '',
+      endTime: '',
       gpxText,
       showForVolunteers: eventVisibleForVolunteers,
     };
@@ -726,14 +1397,10 @@ export default function App() {
     await persistEvents(nextEvents);
     setEventName('');
     setEventDate('');
-    setEventStartTime('');
-    setEventEndTime('');
     setEventGpxText('');
     setEventGpxFileName('');
     setEventVisibleForVolunteers(false);
     setEventDateValue(null);
-    setEventStartTimeValue(null);
-    setEventEndTimeValue(null);
     setEventPickerTarget(null);
   };
 
@@ -749,8 +1416,29 @@ export default function App() {
 
     setCurrentUser(found);
     setLoginPassword('');
+
+    if (isGlobalAdminRole(found.role)) {
+      setCurrentManifestationId(found.manifestationId ?? DEFAULT_MANIFESTATION_ID);
+      setCurrentPage('manifestations');
+      void persistAuthSession({
+        userId: found.id,
+        manifestationId: found.manifestationId ?? DEFAULT_MANIFESTATION_ID,
+        page: 'manifestations',
+        savedAt: Date.now(),
+      });
+      return;
+    }
+
+    const manifestationId = found.manifestationId ?? DEFAULT_MANIFESTATION_ID;
+    setCurrentManifestationId(manifestationId);
     setCurrentPage('carte');
-    
+    void persistAuthSession({
+      userId: found.id,
+      manifestationId,
+      page: 'carte',
+      savedAt: Date.now(),
+    });
+
     // Commencer à tracker la position GPS réelle
     startLocationTracking();
   };
@@ -761,9 +1449,16 @@ export default function App() {
     setLoginPassword('');
     setCurrentPage('carte');
     setCurrentLocation(null);
+    setCurrentManifestationId(null);
+    void persistAuthSession(null);
   };
 
   const handleCreateUser = async () => {
+    if (!currentUser || !currentManifestationId) {
+      Alert.alert('Erreur', 'Sélectionne d abord une manifestation.');
+      return;
+    }
+
     const username = newUsername.trim();
     const password = newPassword.trim();
 
@@ -782,6 +1477,7 @@ export default function App() {
       username,
       password,
       role: newRole,
+      manifestationId: isGlobalAdminRole(newRole) ? undefined : currentManifestationId,
     };
 
     const nextUsers = [...users, nextUser];
@@ -797,7 +1493,7 @@ export default function App() {
       return;
     }
 
-    if (target.username === 'admin') {
+    if (target.username === 'admin' && target.role === 'admin') {
       Alert.alert('Action impossible', 'Le compte admin par defaut ne peut pas etre supprime.');
       return;
     }
@@ -834,8 +1530,8 @@ export default function App() {
     if (!activeEventId) {
       return null;
     }
-    return events.find((event: EventItem) => event.id === activeEventId) ?? null;
-  }, [activeEventId, events]);
+    return currentManifestationEvents.find((event: EventItem) => event.id === activeEventId) ?? null;
+  }, [activeEventId, currentManifestationEvents]);
 
   const activeEventPoints = useMemo(() => {
     if (!activeEvent) {
@@ -852,15 +1548,15 @@ export default function App() {
       return;
     }
 
-    const eventToStart = events.find((event: EventItem) => event.id === selectedEventId);
+    const eventToStart = currentManifestationEvents.find((event: EventItem) => event.id === selectedEventId);
     if (!eventToStart) {
-      Alert.alert('Erreur', 'Evenement introuvable.');
+      Alert.alert('Erreur', 'Évènement introuvable.');
       return;
     }
 
     const points = parseGpxTrackPoints(eventToStart.gpxText);
     if (points.length < 2) {
-      Alert.alert('Erreur', 'Le parcours de cet evenement est invalide.');
+      Alert.alert('Erreur', 'Le parcours de cet évènement est invalide.');
       return;
     }
 
@@ -921,6 +1617,7 @@ export default function App() {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       userId: currentUser.id,
       username: currentUser.username,
+      manifestationId: activeEvent.manifestationId,
       eventId: activeEvent.id,
       eventName: activeEvent.name,
       timestamp: Date.now(),
@@ -965,7 +1662,7 @@ export default function App() {
       return;
     }
 
-    activateKeepAwakeAsync('navigation-active');
+    activateKeepAwake('navigation-active');
     return () => {
       deactivateKeepAwake('navigation-active');
     };
@@ -978,6 +1675,19 @@ export default function App() {
 
     currentHeadingRef.current = currentHeading;
   }, [currentHeading]);
+
+  useEffect(() => {
+    if (!navigationStartedAt) {
+      setElapsedSeconds(0);
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - navigationStartedAt) / 1000));
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [navigationStartedAt]);
 
   useEffect(() => {
     navigationModeRef.current = navigationMode;
@@ -1006,7 +1716,7 @@ export default function App() {
     }
 
     const fromIndex = Math.min(Math.max(0, nextIndex), routePoints.length - 1);
-    const nextPoints = routePoints.slice(fromIndex, Math.min(fromIndex + 6, routePoints.length));
+    const nextPoints = routePoints.slice(fromIndex, Math.min(fromIndex + 10, routePoints.length));
     const pointsToFit = [locationPoint, ...nextPoints];
 
     if (pointsToFit.length < 2) {
@@ -1076,18 +1786,18 @@ export default function App() {
     }
 
     let coveredFromBottom = 0;
-    if (legendLayout) {
-      coveredFromBottom = Math.max(coveredFromBottom, mapContainerHeight - legendLayout.y);
-    }
     if (participantPanelLayout) {
       coveredFromBottom = Math.max(coveredFromBottom, mapContainerHeight - participantPanelLayout.y);
+    }
+    if (navigationStatsLayout) {
+      coveredFromBottom = Math.max(coveredFromBottom, mapContainerHeight - navigationStatsLayout.y);
     }
 
     return Math.max(150, Math.ceil(coveredFromBottom) + 16);
   };
 
   useEffect(() => {
-    if (currentUser?.role !== 'participant' || !activeEventId || navigationMode !== 'normal') {
+    if (currentUser?.role !== 'participant' || !activeEventId) {
       return;
     }
 
@@ -1102,13 +1812,12 @@ export default function App() {
     activeEventPoints,
     currentLocation,
     currentUser?.role,
-    legendLayout,
     mapContainerHeight,
     mapNoticeLayout,
-    navigationMode,
     nextWaypointIndex,
     participantPanelLayout,
     adminEmergencyLayout,
+    navigationStatsLayout,
   ]);
 
   useEffect(() => {
@@ -1260,11 +1969,13 @@ export default function App() {
     adminEmergencyLayout,
     currentUser,
     emergencyAlerts.length,
-    legendLayout,
     mapContainerHeight,
     mapNoticeLayout,
     participantPanelLayout,
   ]);
+
+  const isParticipantNormalNavigation =
+    currentUser?.role === 'participant' && activeEventId !== null;
 
   const handleUpdateAccount = async () => {
     if (!currentUser) {
@@ -1291,11 +2002,18 @@ export default function App() {
       ...currentUser,
       username,
       password,
+      preferredMapType: accountMapType,
     };
 
     const nextUsers = users.map((u: User) => (u.id === currentUser.id ? updatedUser : u));
     await persistUsers(nextUsers);
     setCurrentUser(updatedUser);
+    void persistAuthSession({
+      userId: updatedUser.id,
+      manifestationId: updatedUser.manifestationId ?? null,
+      page: currentUser.role === 'participant' ? 'carte' : currentPage,
+      savedAt: Date.now(),
+    });
 
     if (currentUser.username !== username) {
       const nextLocations = userLocations.map((loc: UserLocation) =>
@@ -1307,6 +2025,23 @@ export default function App() {
     Alert.alert('Succès', 'Ton compte a ete mis a jour.');
   };
 
+  useEffect(() => {
+    if (!isParticipantNormalNavigation || !mapRef.current || !currentLocation) {
+      return;
+    }
+
+    const animationConfig = {
+      bearing: normalizeDegrees(currentHeading),
+      duration: 500,
+    };
+
+    if (mapRef.current.animateCamera) {
+      mapRef.current.animateCamera(animationConfig, { duration: 500 });
+    } else if (mapRef.current.setCamera) {
+      mapRef.current.setCamera(animationConfig);
+    }
+  }, [currentHeading, isParticipantNormalNavigation, currentLocation]);
+
   const visibleEvents: VisibleEvent[] = useMemo(() => {
     if (!currentUser) {
       return [];
@@ -1314,7 +2049,7 @@ export default function App() {
 
     const nextVisibleEvents: VisibleEvent[] = [];
 
-    events.forEach((event: EventItem) => {
+    currentManifestationEvents.forEach((event: EventItem) => {
       const points = parseGpxTrackPoints(event.gpxText);
       if (points.length >= 2 && isEventVisibleForUser(event, currentUser.role)) {
         nextVisibleEvents.push({
@@ -1326,22 +2061,22 @@ export default function App() {
     });
 
     return nextVisibleEvents;
-  }, [currentUser, events]);
+  }, [currentManifestationEvents, currentUser]);
 
   const sortedEvents = useMemo(() => {
-    return [...events].sort((left, right) => {
+    return [...currentManifestationEvents].sort((left, right) => {
       const leftStamp = `${left.date} ${left.startTime}`;
       const rightStamp = `${right.date} ${right.startTime}`;
       return leftStamp.localeCompare(rightStamp);
     });
-  }, [events]);
+  }, [currentManifestationEvents]);
 
   const selectedEvent = useMemo(() => {
     if (!selectedEventId) {
       return null;
     }
-    return events.find((event: EventItem) => event.id === selectedEventId) ?? null;
-  }, [events, selectedEventId]);
+    return currentManifestationEvents.find((event: EventItem) => event.id === selectedEventId) ?? null;
+  }, [currentManifestationEvents, selectedEventId]);
 
   const selectedEventPoints = useMemo(
     () => (selectedEvent ? parseGpxTrackPoints(selectedEvent.gpxText) : []),
@@ -1397,17 +2132,33 @@ export default function App() {
   }, [currentHeading, currentLocation, nextWaypoint]);
 
   const emergencyAlertsForAdmins = useMemo(
-    () => emergencyAlerts.slice(0, 5),
-    [emergencyAlerts]
+    () => currentManifestationAlerts.slice(0, 5),
+    [currentManifestationAlerts]
   );
 
+  const displayedUserLocations = isOffline ? lastKnownUserLocations : currentManifestationLocations;
+  const visibleUserLocations = useMemo(() => {
+    return displayedUserLocations.filter((location) => {
+      const user = users.find((candidate) => candidate.id === location.userId);
+      return user ? !isGlobalAdminRole(user.role) : false;
+    });
+  }, [displayedUserLocations, users]);
+
+  const mapInitialRegion = currentLocation
+    ? {
+        latitude: currentLocation.latitude,
+        longitude: currentLocation.longitude,
+        latitudeDelta: isOffline ? 0.7 : 0.0922,
+        longitudeDelta: isOffline ? 0.7 : 0.0421,
+      }
+    : DEFAULT_MAP_REGION;
+
+  const showOfflineOverlay = currentPage === 'carte' && isOffline;
   const showMapNoticeOverlay = (!currentLocation && Platform.OS !== 'web') || Platform.OS === 'web';
   const showParticipantPanelOverlay =
-    currentPage === 'carte' && currentUser?.role === 'participant' && !(activeEventId && navigationMode === 'focus');
+    currentPage === 'carte' && currentUser?.role === 'participant';
   const showAdminEmergencyOverlay =
-    currentPage === 'carte' && currentUser?.role === 'admin' && emergencyAlertsForAdmins.length > 0;
-  const showLegendOverlay =
-    currentPage === 'carte' && (!isParticipantNavigationActive || navigationMode !== 'normal');
+    currentPage === 'carte' && isManifestationAdminRole(currentUser?.role ?? 'participant') && emergencyAlertsForAdmins.length > 0;
 
   useEffect(() => {
     if (!showMapNoticeOverlay) {
@@ -1419,13 +2170,10 @@ export default function App() {
     if (!showAdminEmergencyOverlay) {
       setAdminEmergencyLayout(null);
     }
-    if (!showLegendOverlay) {
-      setLegendLayout(null);
-    }
-  }, [showAdminEmergencyOverlay, showLegendOverlay, showMapNoticeOverlay, showParticipantPanelOverlay]);
+  }, [showAdminEmergencyOverlay, showMapNoticeOverlay, showParticipantPanelOverlay]);
 
-  const isParticipantNormalNavigation =
-    currentUser?.role === 'participant' && activeEventId !== null && navigationMode === 'normal';
+  const currentManifestationDisplayName = currentManifestation?.name ?? 'Aucune manifestation sélectionnée';
+  const appLogoSource = require('./assets/logo intersport.bmp');
 
   if (!useCloudSync) {
     return (
@@ -1435,7 +2183,7 @@ export default function App() {
           <View style={styles.centered}>
             <Text style={styles.title}>Configuration requise</Text>
             <Text style={styles.subtitle}>
-              Pour que comptes, evenements et positions soient communs entre tous les appareils
+              Pour que comptes, évènements et positions soient communs entre tous les appareils
               (Android, iPhone, web), renseigne EXPO_PUBLIC_FIREBASE_DATABASE_URL ou expo.extra.databaseURL.
             </Text>
           </View>
@@ -1450,6 +2198,7 @@ export default function App() {
         <SafeAreaView style={styles.screen}>
           <StatusBar style="dark" />
           <View style={styles.centered}>
+            <Image source={appLogoSource} style={styles.splashLogo} />
             <Text style={styles.title}>Chargement...</Text>
           </View>
         </SafeAreaView>
@@ -1467,7 +2216,8 @@ export default function App() {
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           >
             <View style={styles.authContainer}>
-              <Text style={styles.appName}>Les Sources</Text>
+              <Image source={appLogoSource} style={styles.authLogo} />
+              <Text style={styles.appName}>TOC Lozère</Text>
               <Text style={styles.subtitle}>Connexion</Text>
 
               <TextInput
@@ -1503,10 +2253,13 @@ export default function App() {
         <View style={styles.panelHeader}>
           <View>
             <Text style={styles.panelTitle}>Bonjour {currentUser.username}</Text>
-            <Text style={styles.panelSubtitle}>Role: {currentUser.role}</Text>
+            <Text style={styles.panelSubtitle}>
+              {getRoleLabel(currentUser.role)}
+              {currentManifestation ? ` · ${currentManifestation.name}` : ''}
+            </Text>
           </View>
-          <Pressable style={styles.secondaryButton} onPress={handleLogout}>
-            <Text style={styles.secondaryButtonText}>Deconnexion</Text>
+          <Pressable style={styles.headerActionButton} onPress={handleLogout}>
+            <Text style={styles.headerActionButtonText}>Deconnexion</Text>
           </Pressable>
         </View>
       )}
@@ -1514,6 +2267,21 @@ export default function App() {
       {/* Navigation tabs */}
       {!isParticipantNavigationActive && (
         <View style={styles.navTabs}>
+          {isGlobalAdminRole(currentUser.role) && (
+            <Pressable
+              style={[styles.navTab, currentPage === 'manifestations' && styles.navTabActive]}
+              onPress={() => setCurrentPage('manifestations')}
+            >
+              <Text
+                style={[
+                  styles.navTabText,
+                  currentPage === 'manifestations' && styles.navTabTextActive,
+                ]}
+              >
+                Manifestations
+              </Text>
+            </Pressable>
+          )}
           <Pressable
             style={[styles.navTab, currentPage === 'carte' && styles.navTabActive]}
             onPress={() => setCurrentPage('carte')}
@@ -1530,7 +2298,7 @@ export default function App() {
               Mon Compte
             </Text>
           </Pressable>
-          {currentUser.role === 'admin' && (
+          {isManifestationAdminRole(currentUser.role) && (
             <Pressable
               style={[styles.navTab, currentPage === 'admin' && styles.navTabActive]}
               onPress={() => setCurrentPage('admin')}
@@ -1544,104 +2312,85 @@ export default function App() {
       )}
 
       {/* Content pages */}
-      {currentPage === 'carte' ? (
+      {currentPage === 'manifestations' && isGlobalAdminRole(currentUser.role) ? (
+        <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
+          <View style={styles.adminContainer}>
+            <Text style={styles.sectionTitle}>Sélecteur de manifestation</Text>
+            <Text style={styles.accountSubtitle}>
+              {currentManifestation
+                ? `Manifestation active: ${currentManifestation.name}`
+                : 'Choisis une manifestation pour ouvrir son espace.'}
+            </Text>
+
+            <View style={styles.manifestationCreateCard}>
+              <Text style={styles.sectionTitle}>Créer une manifestation</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Nom de la manifestation"
+                value={manifestationName}
+                onChangeText={setManifestationName}
+              />
+              <Pressable style={styles.button} onPress={handleCreateManifestation}>
+                <Text style={styles.buttonText}>Créer la manifestation</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.sectionTitle}>Manifestations existantes</Text>
+            <View style={styles.listGap}>
+              {manifestations.length === 0 ? (
+                <Text style={styles.emptyText}>Aucune manifestation enregistrée.</Text>
+              ) : (
+                manifestations.map((manifestation) => {
+                  const isSelected = manifestation.id === currentManifestationId;
+                  return (
+                    <View key={manifestation.id} style={styles.manifestationCard}>
+                      <View>
+                        <Text style={styles.userName}>{manifestation.name}</Text>
+                        <Text style={styles.userRole}>
+                          Créée le {new Date(manifestation.createdAt).toLocaleDateString()}
+                        </Text>
+                      </View>
+                      <View style={styles.manifestationActions}>
+                        <Pressable
+                          style={[styles.manifestationActionButton, isSelected && styles.manifestationActionButtonActive]}
+                          onPress={() => handleSelectManifestation(manifestation.id)}
+                        >
+                          <Text style={[styles.manifestationActionButtonText, isSelected && styles.manifestationActionButtonTextActive]}>
+                            {isSelected ? 'Ouverte' : 'Ouvrir'}
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.manifestationDeleteButton}
+                          onPress={() => handleDeleteManifestation(manifestation.id)}
+                        >
+                          <Text style={styles.manifestationDeleteButtonText}>Supprimer</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })
+              )}
+            </View>
+          </View>
+        </ScrollView>
+      ) : currentPage === 'carte' ? (
         <View
           style={styles.carteContainer}
           onLayout={(event: LayoutChangeEvent) => {
             setMapContainerHeight(event.nativeEvent.layout.height);
           }}
         >
-          {currentUser.role === 'participant' && activeEventId && navigationMode === 'focus' ? (
-            <View style={styles.focusContainer}>
-              <View style={styles.focusEmergencyWrap}>
-                <Pressable style={styles.focusUrgencyButton} onPress={triggerEmergency}>
-                  <Text style={styles.focusUrgencyButtonText}>
-                    Urgence {emergencyCountdown !== null ? `(${emergencyCountdown}s)` : ''}
-                  </Text>
-                </Pressable>
-              </View>
-
-              <Text style={styles.focusTitle}>Mode Focus</Text>
-              <Text style={styles.focusSubtitle}>Suis la flèche selon le cap du téléphone</Text>
-
-              <View style={styles.focusArrowFrame}>
-                <View
-                  style={[
-                    styles.focusArrow,
-                    {
-                      transform: [{ rotate: `${directionToNextPoint}deg` }],
-                    },
-                  ]}
-                />
-              </View>
-
-              <View style={styles.navigationMetricsCard}>
-                <Text style={styles.navigationMetric}>Vitesse: {currentSpeedKmh.toFixed(1)} km/h</Text>
-                <Text style={styles.navigationMetric}>Vitesse moyenne: {averageSpeedKmh.toFixed(1)} km/h</Text>
-                <Text style={styles.navigationMetric}>Parcourus: {formatKm(distanceTravelledMeters)}</Text>
-                <Text style={styles.navigationMetric}>Restants: {formatKm(Math.max(0, remainingDistanceMeters))}</Text>
-                <Text style={styles.navigationMetricAlert}>
-                  {offRouteDistanceMeters > 10
-                    ? `Alerte éloignement: ${offRouteDistanceMeters.toFixed(1)} m`
-                    : `Sur parcours (${offRouteDistanceMeters.toFixed(1)} m)`}
-                </Text>
-              </View>
-
-              <View style={styles.modeSwitchRow}>
-                <Pressable
-                  style={[styles.modeButton, navigationMode === 'normal' && styles.modeButtonActive]}
-                  onPress={() => setNavigationMode('normal')}
-                >
-                  <Text
-                    style={[
-                      styles.modeButtonText,
-                      navigationMode === 'normal' && styles.modeButtonTextActive,
-                    ]}
-                  >
-                    Mode normal
-                  </Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.modeButton, navigationMode === 'focus' && styles.modeButtonActive]}
-                  onPress={() => setNavigationMode('focus')}
-                >
-                  <Text
-                    style={[
-                      styles.modeButtonText,
-                      navigationMode === 'focus' && styles.modeButtonTextActive,
-                    ]}
-                  >
-                    Mode focus
-                  </Text>
-                </Pressable>
-              </View>
-
-              <Pressable style={styles.secondaryButton} onPress={handleStopEventNavigation}>
-                <Text style={styles.secondaryButtonText}>Arrêter l'évènement</Text>
-              </Pressable>
-            </View>
-          ) : (
-            <>
               {canRenderNativeMap ? (
                 <MapView
                   ref={(instance: any) => {
                     mapRef.current = instance;
                   }}
                   style={styles.map}
-                  initialRegion={
-                    currentLocation
-                      ? {
-                          latitude: currentLocation.latitude,
-                          longitude: currentLocation.longitude,
-                          latitudeDelta: 0.0922,
-                          longitudeDelta: 0.0421,
-                        }
-                      : DEFAULT_MAP_REGION
-                  }
-                  mapType="satellite"
+                  initialRegion={mapInitialRegion}
+                  mapType={mapType}
                   rotateEnabled={currentUser.role === 'participant' && activeEventId !== null}
                 >
-                  {currentLocation && (
+                  {currentLocation && !isGlobalAdminRole(currentUser.role) && (
                     isParticipantNormalNavigation ? (
                       <Marker
                         coordinate={{
@@ -1660,7 +2409,9 @@ export default function App() {
                               styles.participantArrowGlyph,
                               {
                                 color: '#2563eb',
-                                transform: [{ rotate: `${normalizeDegrees(currentHeading)}deg` }],
+                                /* Counter-rotate the glyph so it stays pointing up on screen
+                                   while the map rotates to match the participant heading */
+                                transform: [{ rotate: `${-normalizeDegrees(currentHeading)}deg` }],
                               },
                             ]}
                           >
@@ -1681,15 +2432,15 @@ export default function App() {
                     )
                   )}
 
-                  {userLocations.map((location: UserLocation) => {
+                  {visibleUserLocations.map((location: UserLocation) => {
                     if (location.userId === currentUser.id) return null;
-                    const user = users.find((u: User) => u.id === location.userId);
+                    const user = currentManifestationUsers.find((u: User) => u.id === location.userId);
                     if (!user) return null;
 
                     const isFollowingEventParticipant =
                       user.role === 'participant' && Boolean(location.isFollowingEvent);
                     const showFollowingArrowForSupervisor =
-                      (currentUser.role === 'admin' || currentUser.role === 'benevole') &&
+                      (isManifestationAdminRole(currentUser.role) || currentUser.role === 'benevole') &&
                       isFollowingEventParticipant;
 
                     if (isParticipantNormalNavigation && user.role !== 'participant') {
@@ -1714,10 +2465,16 @@ export default function App() {
                             <Text
                               style={[
                                 styles.participantArrowGlyph,
-                                {
+                                ({
                                   color: '#dc2626',
-                                  transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
-                                },
+                                  /* Rotate other participants' glyphs relative to current heading
+                                     so arrows point in their travel direction on screen */
+                                  transform: [
+                                    {
+                                      rotate: `${normalizeDegrees((location.heading ?? 0) - currentHeading)}deg`,
+                                    },
+                                  ],
+                                }),
                               ]}
                             >
                               ▲
@@ -1736,7 +2493,7 @@ export default function App() {
                             longitude: location.longitude,
                           }}
                           title={location.username}
-                          description="Participant en suivi d evenement"
+                          description="Participant en suivi d'évènement"
                           anchor={{ x: 0.5, y: 0.5 }}
                           flat
                           tracksViewChanges
@@ -1747,7 +2504,11 @@ export default function App() {
                                 styles.participantArrowGlyph,
                                 {
                                   color: '#ff8c42',
-                                  transform: [{ rotate: `${normalizeDegrees(location.heading ?? 0)}deg` }],
+                                  transform: [
+                                    {
+                                      rotate: `${normalizeDegrees((location.heading ?? 0) - currentHeading)}deg`,
+                                    },
+                                  ],
                                 },
                               ]}
                             >
@@ -1779,17 +2540,19 @@ export default function App() {
                     const isActive = event.id === activeEventId;
 
                     return (
-                      <Fragment key={event.id}>
+                      <Fragment key={`event-${event.id}`}>
                         <Polyline
+                          key={`polyline-${event.id}`}
                           coordinates={points}
-                          strokeColor={isSelected || isActive ? '#22c55e' : color}
+                          strokeColor={isActive ? '#FFFF00' : isSelected ? '#000000' : color}
                           strokeWidth={isSelected || isActive ? 6 : 4}
                         />
                         <Marker
+                          key={`marker-${event.id}`}
                           coordinate={points[0]}
                           title={event.name}
-                          description={`${event.date} ${event.startTime} - ${event.endTime}`}
-                          pinColor={isSelected || isActive ? '#22c55e' : color}
+                          description={`${event.date}${event.startTime ? ` ${event.startTime}` : ''}${event.endTime ? ` - ${event.endTime}` : ''}`}
+                          pinColor={isActive ? '#FFFF00' : isSelected ? '#000000' : color}
                           onPress={() => {
                             if (currentUser.role === 'participant') {
                               setSelectedEventId(event.id);
@@ -1815,7 +2578,15 @@ export default function App() {
               )}
 
               {currentLocation && !isParticipantNavigationActive && (
-                <Pressable style={styles.recenterButton} onPress={handleRecenterMap}>
+                <Pressable
+                  style={[
+                    styles.recenterButton,
+                    currentUser.role === 'participant' && participantPanelLayout && {
+                      bottom: 132 + participantPanelLayout.height + 20,
+                    },
+                  ]}
+                  onPress={handleRecenterMap}
+                >
                   <Text style={styles.recenterButtonText}>Recentrer</Text>
                 </Pressable>
               )}
@@ -1829,7 +2600,7 @@ export default function App() {
                   }}
                 >
                   <Text style={styles.mapNoticeText}>
-                    Position GPS indisponible. La carte affiche quand meme les evenements.
+                    Position GPS indisponible. La carte affiche quand meme les évènements.
                   </Text>
                 </View>
               )}
@@ -1848,9 +2619,20 @@ export default function App() {
                 </View>
               )}
 
-              {currentUser.role === 'participant' && (
+              {showOfflineOverlay && (
+                <View style={styles.offlineNotice} pointerEvents="none">
+                  <Text style={styles.offlineNoticeText}>
+                    Mode hors connexion : dernières positions connues affichées.
+                  </Text>
+                </View>
+              )}
+
+              {currentUser.role === 'participant' && !activeEventId && (
                 <View
-                  style={[styles.participantPanel, activeEventId && styles.participantPanelActive]}
+                  style={[
+                    styles.participantPanel,
+                    activeEventId ? styles.participantPanelActive : undefined,
+                  ]}
                   onLayout={(event: LayoutChangeEvent) => {
                     setParticipantPanelLayout(extractLayout(event));
                   }}
@@ -1882,48 +2664,6 @@ export default function App() {
                   ) : (
                     <>
                       <Text style={styles.participantPanelTitle}>{activeEvent?.name ?? 'Navigation en cours'}</Text>
-                      <View style={styles.modeSwitchRow}>
-                        <Pressable
-                          style={[styles.modeButton, navigationMode === 'normal' && styles.modeButtonActive]}
-                          onPress={() => setNavigationMode('normal')}
-                        >
-                          <Text
-                            style={[
-                              styles.modeButtonText,
-                              navigationMode === 'normal' && styles.modeButtonTextActive,
-                            ]}
-                          >
-                            Mode normal
-                          </Text>
-                        </Pressable>
-                        <Pressable
-                          style={[styles.modeButton, navigationMode === 'focus' && styles.modeButtonActive]}
-                          onPress={() => setNavigationMode('focus')}
-                        >
-                          <Text
-                            style={[
-                              styles.modeButtonText,
-                              navigationMode === 'focus' && styles.modeButtonTextActive,
-                            ]}
-                          >
-                            Mode focus
-                          </Text>
-                        </Pressable>
-                      </View>
-
-                      <View style={styles.navigationMetricsCard}>
-                        <Text style={styles.navigationMetric}>Vitesse: {currentSpeedKmh.toFixed(1)} km/h</Text>
-                        <Text style={styles.navigationMetric}>Vitesse moyenne: {averageSpeedKmh.toFixed(1)} km/h</Text>
-                        <Text style={styles.navigationMetric}>Parcourus: {formatKm(distanceTravelledMeters)}</Text>
-                        <Text style={styles.navigationMetric}>Restants: {formatKm(Math.max(0, remainingDistanceMeters))}</Text>
-                        <Text style={styles.navigationMetric}>Direction: {getDirectionArrow(directionToNextPoint)} {Math.round(directionToNextPoint)}°</Text>
-                        <Text style={styles.navigationMetricAlert}>
-                          {offRouteDistanceMeters > 10
-                            ? `Alerte éloignement: ${offRouteDistanceMeters.toFixed(1)} m`
-                            : `Sur parcours (${offRouteDistanceMeters.toFixed(1)} m)`}
-                        </Text>
-                      </View>
-
                       <View style={styles.actionRow}>
                         <Pressable style={styles.urgencyButton} onPress={triggerEmergency}>
                           <Text style={styles.urgencyButtonText}>
@@ -1939,7 +2679,7 @@ export default function App() {
                 </View>
               )}
 
-              {currentUser.role === 'admin' && emergencyAlertsForAdmins.length > 0 && (
+              {isManifestationAdminRole(currentUser.role) && emergencyAlertsForAdmins.length > 0 && (
                 <View
                   style={styles.adminEmergencyPanel}
                   onLayout={(event: LayoutChangeEvent) => {
@@ -1961,34 +2701,51 @@ export default function App() {
                 </View>
               )}
 
-              {/* Légende */}
-              {!isParticipantNavigationActive || navigationMode !== 'normal' ? (
+              {/* Stats de navigation */}
+              {isParticipantNavigationActive && (
                 <View
-                  style={styles.legend}
+                  style={styles.navigationStats}
                   onLayout={(event: LayoutChangeEvent) => {
-                    setLegendLayout(extractLayout(event));
+                    setNavigationStatsLayout(extractLayout(event));
                   }}
                 >
-                  <View style={styles.legendItem}>
-                    <View style={[styles.legendColor, { backgroundColor: '#ff8c42' }]} />
-                    <Text style={styles.legendText}>Participant</Text>
+                  <View style={styles.statsRow}>
+                    <View style={styles.statCard}>
+                      <Text style={styles.statLabel}>Vitesse</Text>
+                      <Text style={styles.statValue}>{currentSpeedKmh.toFixed(1)} km/h</Text>
+                    </View>
+                    <View style={styles.statCard}>
+                      <Text style={styles.statLabel}>Distance</Text>
+                      <Text style={styles.statValue}>{formatKm(distanceTravelledMeters)}</Text>
+                    </View>
                   </View>
-                  <View style={styles.legendItem}>
-                    <View style={[styles.legendColor, { backgroundColor: '#4b7bff' }]} />
-                    <Text style={styles.legendText}>Bénévole</Text>
+                  <View style={styles.statsRow}>
+                    <View style={styles.statCard}>
+                      <Text style={styles.statLabel}>Total</Text>
+                      <Text style={styles.statValue}>{formatKm(activeRouteLengthMeters)}</Text>
+                    </View>
+                    <View style={styles.statCard}>
+                      <Text style={styles.statLabel}>Moyenne</Text>
+                      <Text style={styles.statValue}>{averageSpeedKmh.toFixed(1)} km/h</Text>
+                    </View>
                   </View>
-                  <View style={styles.legendItem}>
-                    <View style={[styles.legendColor, { backgroundColor: '#0f766e' }]} />
-                    <Text style={styles.legendText}>Admin</Text>
-                  </View>
-                  <View style={styles.legendItem}>
-                    <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
-                    <Text style={styles.legendText}>Evenement GPX</Text>
+                  <View style={styles.statsRow}>
+                    <View style={[styles.statCard, { flex: 1 }]}>
+                      <Text style={styles.statLabel}>Temps</Text>
+                      <Text style={styles.statValue}>{formatElapsedTime(elapsedSeconds)}</Text>
+                    </View>
+                    <Pressable style={styles.emergencyButtonSmall} onPress={triggerEmergency}>
+                      <Text style={styles.emergencyButtonSmallText}>
+                        Urgence {emergencyCountdown !== null ? `(${emergencyCountdown}s)` : ''}
+                      </Text>
+                    </Pressable>
+                    <Pressable style={styles.stopButtonSmall} onPress={handleStopEventNavigation}>
+                      <Text style={styles.stopButtonSmallText}>Arrêter</Text>
+                    </Pressable>
                   </View>
                 </View>
-              ) : null}
-            </>
-          )}
+              )}
+
         </View>
       ) : currentPage === 'compte' ? (
         <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
@@ -2015,55 +2772,59 @@ export default function App() {
               secureTextEntry
             />
 
+            <View style={styles.eventFieldGroup}>
+              <Text style={styles.eventFieldLabel}>Fond de carte</Text>
+              <View style={styles.modeSwitchRow}>
+                {(['standard', 'satellite', 'hybrid'] as MapType[]).map((type) => (
+                  <Pressable
+                    key={type}
+                    style={[
+                      styles.modeButton,
+                      accountMapType === type && styles.modeButtonActive,
+                    ]}
+                    onPress={() => {
+                      setAccountMapType(type);
+                      setMapType(type);
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.modeButtonText,
+                        accountMapType === type && styles.modeButtonTextActive,
+                      ]}
+                    >
+                      {type === 'standard' ? 'Normal' : type === 'satellite' ? 'Satellite' : 'Hybride'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
             <Pressable style={styles.button} onPress={handleUpdateAccount}>
               <Text style={styles.buttonText}>Enregistrer mes modifications</Text>
             </Pressable>
           </View>
         </ScrollView>
-      ) : currentUser.role === 'admin' ? (
+      ) : isManifestationAdminRole(currentUser.role) ? (
         <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
           <View style={styles.adminContainer}>
-            <Text style={styles.sectionTitle}>Creer un evenement</Text>
+            <Text style={styles.sectionTitle}>Créer un évènement</Text>
             <TextInput
               style={styles.input}
-              placeholder="Nom de l evenement (ex: Trail des Sources)"
+              placeholder="Nom de l'évènement (ex: Trail des Sources)"
               value={eventName}
               onChangeText={setEventName}
             />
             <View style={styles.eventFieldGroup}>
               <Text style={styles.eventFieldLabel}>Date</Text>
               <Pressable
-                style={[styles.selectorField, styles.selectorDateField]}
+                style={styles.selectorField}
                 onPress={openEventDatePicker}
               >
                 <Text style={eventDate ? styles.selectorText : styles.selectorPlaceholderText}>
                   {eventDate || 'Sélectionner la date'}
                 </Text>
               </Pressable>
-            </View>
-            <View style={styles.fieldRow}>
-              <View style={[styles.eventFieldGroup, styles.halfInput]}>
-                <Text style={styles.eventFieldLabel}>Heure de début</Text>
-                <Pressable
-                  style={styles.selectorField}
-                  onPress={openEventStartTimePicker}
-                >
-                  <Text style={eventStartTime ? styles.selectorText : styles.selectorPlaceholderText}>
-                    {eventStartTime || 'Choisir'}
-                  </Text>
-                </Pressable>
-              </View>
-              <View style={[styles.eventFieldGroup, styles.halfInput]}>
-                <Text style={styles.eventFieldLabel}>Heure de fin</Text>
-                <Pressable
-                  style={styles.selectorField}
-                  onPress={openEventEndTimePicker}
-                >
-                  <Text style={eventEndTime ? styles.selectorText : styles.selectorPlaceholderText}>
-                    {eventEndTime || 'Choisir'}
-                  </Text>
-                </Pressable>
-              </View>
             </View>
             <View style={styles.checkboxRow}>
               <Pressable
@@ -2090,12 +2851,12 @@ export default function App() {
             </View>
 
             <Pressable style={styles.button} onPress={handleCreateEvent}>
-              <Text style={styles.buttonText}>Creer l evenement</Text>
+              <Text style={styles.buttonText}>Creer l'évènement</Text>
             </Pressable>
 
-            <Text style={styles.sectionTitle}>Evenements enregistres</Text>
+            <Text style={styles.sectionTitle}>Évènements enregistrés</Text>
             {sortedEvents.length === 0 ? (
-              <Text style={styles.emptyText}>Aucun evenement pour le moment.</Text>
+              <Text style={styles.emptyText}>Aucun évènement pour le moment.</Text>
             ) : (
               <View style={styles.eventList}>
                 {sortedEvents.map((event) => {
@@ -2113,9 +2874,13 @@ export default function App() {
                           <Text style={styles.eventCardMeta}>
                             {event.date} {isToday ? '(aujourd hui)' : ''}
                           </Text>
-                          <Text style={styles.eventCardMeta}>
-                            {event.startTime} - {event.endTime}
-                          </Text>
+                          {(event.startTime || event.endTime) ? (
+                            <Text style={styles.eventCardMeta}>
+                              {event.startTime}
+                              {event.startTime && event.endTime ? ' - ' : ''}
+                              {event.endTime}
+                            </Text>
+                          ) : null}
                         </View>
                         <View style={styles.eventHeaderActions}>
                           <View style={styles.eventBadge}>
@@ -2182,13 +2947,33 @@ export default function App() {
                   </Text>
                 </Pressable>
                 <Pressable
-                  style={[styles.roleButton, newRole === 'admin' && styles.roleButtonActive]}
-                  onPress={() => setNewRole('admin')}
+                  style={[styles.roleButton, newRole === 'admin_manifestation' && styles.roleButtonActive]}
+                  onPress={() => setNewRole('admin_manifestation')}
                 >
-                  <Text style={[styles.roleButtonText, newRole === 'admin' && styles.roleButtonTextActive]}>
-                    admin
+                  <Text
+                    style={[
+                      styles.roleButtonText,
+                      newRole === 'admin_manifestation' && styles.roleButtonTextActive,
+                    ]}
+                  >
+                    admin manifestation
                   </Text>
                 </Pressable>
+                {isGlobalAdminRole(currentUser.role) && (
+                  <Pressable
+                    style={[styles.roleButton, newRole === 'admin_global' && styles.roleButtonActive]}
+                    onPress={() => setNewRole('admin_global')}
+                  >
+                    <Text
+                      style={[
+                        styles.roleButtonText,
+                        newRole === 'admin_global' && styles.roleButtonTextActive,
+                      ]}
+                    >
+                      admin global
+                    </Text>
+                  </Pressable>
+                )}
               </View>
             </View>
 
@@ -2206,15 +2991,18 @@ export default function App() {
                 <View style={styles.userCard}>
                   <View>
                     <Text style={styles.userName}>{item.username}</Text>
-                    <Text style={styles.userRole}>Role: {item.role}</Text>
+                    <Text style={styles.userRole}>
+                      {getRoleLabel(item.role)}
+                      {item.manifestationId ? ` · ${currentManifestation?.name ?? item.manifestationId}` : ''}
+                    </Text>
                   </View>
                   <Pressable
                     style={[
                       styles.deleteButton,
-                      item.username === 'admin' && styles.deleteButtonDisabled,
+                      item.username === 'admin' && item.role === 'admin' && styles.deleteButtonDisabled,
                     ]}
                     onPress={() => handleDeleteUser(item.id)}
-                    disabled={item.username === 'admin'}
+                    disabled={item.username === 'admin' && item.role === 'admin'}
                   >
                     <Text style={styles.deleteButtonText}>Supprimer</Text>
                   </Pressable>
@@ -2227,7 +3015,7 @@ export default function App() {
         <ScrollView style={styles.pageContainer} contentContainerStyle={styles.pageContent}>
           <View style={styles.accountContainer}>
             <Text style={styles.accountTitle}>Acces refuse</Text>
-            <Text style={styles.accountSubtitle}>Cette section est reservee aux administrateurs.</Text>
+            <Text style={styles.accountSubtitle}>Cette section est reservee aux administrateurs de manifestation.</Text>
           </View>
         </ScrollView>
       )}
@@ -2249,7 +3037,7 @@ export default function App() {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#f5f7fb',
+    backgroundColor: '#EAF4FF',
   },
   flex1: {
     flex: 1,
@@ -2257,57 +3045,82 @@ const styles = StyleSheet.create({
   authContainer: {
     flex: 1,
     justifyContent: 'center',
+    alignItems: 'center',
     padding: 20,
     gap: 12,
+    backgroundColor: '#EAF4FF',
   },
   appName: {
-    fontSize: 34,
-    fontWeight: '800',
-    color: '#102a43',
-    marginBottom: 6,
+    fontSize: 40,
+    fontWeight: 'bold',
+    color: '#5F8FC9',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  authLogo: {
+    width: 120,
+    height: 120,
+    marginBottom: 20,
+    resizeMode: 'contain',
+  },
+  splashLogo: {
+    width: 100,
+    height: 100,
+    marginBottom: 20,
+    resizeMode: 'contain',
   },
   title: {
     fontSize: 24,
     fontWeight: '700',
-    color: '#102a43',
+    color: '#274B74',
   },
   subtitle: {
     fontSize: 16,
-    color: '#486581',
+    color: '#5F8FC9',
+    textAlign: 'center',
+    marginBottom: 20,
   },
   input: {
     borderWidth: 1,
-    borderColor: '#bcccdc',
+    borderColor: '#C9DEF5',
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 12,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#FFFFFF',
     fontSize: 16,
+    color: '#274B74',
+    minHeight: 48,
+    width: '100%',
+    maxWidth: 420,
   },
   selectorField: {
     borderWidth: 1,
-    borderColor: '#bcccdc',
+    borderColor: '#C9DEF5',
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 12,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#FFFFFF',
     justifyContent: 'center',
     minHeight: 48,
+    width: '100%',
+    maxWidth: 420,
   },
   selectorText: {
     fontSize: 16,
-    color: '#102a43',
+    color: '#274B74',
   },
   selectorPlaceholderText: {
     fontSize: 16,
-    color: '#9aa5b1',
+    color: '#5F8FC9',
   },
   button: {
-    backgroundColor: '#0f766e',
+    backgroundColor: '#5F8FC9',
     borderRadius: 10,
     paddingVertical: 12,
     alignItems: 'center',
-    marginTop: 2,
+    marginTop: 10,
+    width: '100%',
+    maxWidth: 420,
   },
   buttonText: {
     color: '#ffffff',
@@ -2316,31 +3129,47 @@ const styles = StyleSheet.create({
   },
   secondaryButton: {
     borderWidth: 1,
-    borderColor: '#9fb3c8',
+    borderColor: '#5F8FC9',
     borderRadius: 10,
     paddingVertical: 12,
     alignItems: 'center',
     marginTop: 2,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#FFFFFF',
+    width: '100%',
+    maxWidth: 420,
   },
   secondaryButtonText: {
-    color: '#334e68',
+    color: '#5F8FC9',
     fontWeight: '700',
     fontSize: 16,
   },
+  headerActionButton: {
+    borderWidth: 1,
+    borderColor: '#C9DEF5',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    backgroundColor: '#FFFFFF',
+    flexShrink: 0,
+  },
+  headerActionButtonText: {
+    color: '#274B74',
+    fontWeight: '700',
+    fontSize: 14,
+  },
   hintBox: {
     marginTop: 10,
-    backgroundColor: '#d9f99d',
+    backgroundColor: '#DCEAFF',
     padding: 12,
     borderRadius: 10,
     gap: 2,
   },
   hint: {
-    color: '#365314',
+    color: '#274B74',
     fontWeight: '600',
   },
   hintStrong: {
-    color: '#14532d',
+    color: '#274B74',
     fontWeight: '700',
   },
   panelHeader: {
@@ -2351,41 +3180,30 @@ const styles = StyleSheet.create({
     paddingTop: 16,
     paddingBottom: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
+    borderBottomColor: '#C9DEF5',
+    backgroundColor: '#FFFFFF',
   },
   panelTitle: {
     fontSize: 20,
     fontWeight: '700',
-    color: '#102a43',
+    color: '#274B74',
   },
   panelSubtitle: {
     fontSize: 14,
-    color: '#627d98',
+    color: '#5F8FC9',
     marginTop: 2,
-  },
-  secondaryButton: {
-    borderWidth: 1,
-    borderColor: '#9fb3c8',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    backgroundColor: '#ffffff',
-  },
-  secondaryButtonText: {
-    color: '#334e68',
-    fontWeight: '600',
   },
   adminContainer: {
     flex: 1,
     paddingHorizontal: 16,
     paddingTop: 16,
     paddingBottom: 8,
+    backgroundColor: '#EAF4FF',
   },
   sectionTitle: {
     fontSize: 17,
     fontWeight: '700',
-    color: '#102a43',
+    color: '#274B74',
     marginBottom: 10,
     marginTop: 10,
   },
@@ -2397,41 +3215,107 @@ const styles = StyleSheet.create({
   },
   roleLabel: {
     fontSize: 15,
-    color: '#334e68',
+    color: '#274B74',
     fontWeight: '600',
   },
   roleButtonsWrap: {
     flexDirection: 'row',
     gap: 8,
+    flexWrap: 'wrap',
   },
   roleButton: {
     borderWidth: 1,
-    borderColor: '#9fb3c8',
+    borderColor: '#5F8FC9',
     borderRadius: 999,
     paddingHorizontal: 14,
-    paddingVertical: 8,
-    backgroundColor: '#ffffff',
+    paddingVertical: 10,
+    backgroundColor: '#FFFFFF',
+    minWidth: 126,
+    flexGrow: 1,
+    alignItems: 'center',
   },
   roleButtonActive: {
-    backgroundColor: '#0f766e',
-    borderColor: '#0f766e',
+    backgroundColor: '#5F8FC9',
+    borderColor: '#5F8FC9',
   },
   roleButtonText: {
-    color: '#334e68',
+    color: '#5F8FC9',
     fontWeight: '600',
   },
   roleButtonTextActive: {
-    color: '#ffffff',
+    color: '#FFFFFF',
   },
   listGap: {
     gap: 10,
     paddingBottom: 20,
   },
+  manifestationCreateCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#C9DEF5',
+    padding: 14,
+    marginTop: 10,
+    marginBottom: 8,
+  },
+  manifestationCard: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#C9DEF5',
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    gap: 12,
+  },
+  manifestationActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+  },
+  manifestationActionButton: {
+    borderWidth: 1,
+    borderColor: '#5F8FC9',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    backgroundColor: '#FFFFFF',
+    minWidth: 110,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  manifestationActionButtonActive: {
+    backgroundColor: '#DCEAFF',
+    borderColor: '#5F8FC9',
+  },
+  manifestationActionButtonText: {
+    color: '#5F8FC9',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  manifestationActionButtonTextActive: {
+    color: '#274B74',
+  },
+  manifestationDeleteButton: {
+    borderWidth: 1,
+    borderColor: '#D32F2F',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    backgroundColor: '#FFFFFF',
+    minWidth: 110,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  manifestationDeleteButtonText: {
+    color: '#D32F2F',
+    fontWeight: '700',
+    fontSize: 14,
+  },
   userCard: {
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
+    borderColor: '#C9DEF5',
+    backgroundColor: '#FFFFFF',
     padding: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -2440,15 +3324,15 @@ const styles = StyleSheet.create({
   userName: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#102a43',
+    color: '#274B74',
   },
   userRole: {
     fontSize: 14,
-    color: '#627d98',
+    color: '#5F8FC9',
     marginTop: 2,
   },
   deleteButton: {
-    backgroundColor: '#fee2e2',
+    backgroundColor: '#FFCDD2',
     borderRadius: 8,
     paddingVertical: 8,
     paddingHorizontal: 10,
@@ -2457,8 +3341,9 @@ const styles = StyleSheet.create({
     opacity: 0.45,
   },
   deleteButtonText: {
-    color: '#991b1b',
+    color: '#B71C1C',
     fontWeight: '700',
+    fontSize: 12,
   },
   centered: {
     flex: 1,
@@ -2466,12 +3351,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 20,
     gap: 8,
+    backgroundColor: '#EAF4FF',
   },
   navTabs: {
     flexDirection: 'row',
-    backgroundColor: '#ffffff',
+    backgroundColor: '#FFFFFF',
     borderBottomWidth: 1,
-    borderBottomColor: '#d9e2ec',
+    borderBottomColor: '#C9DEF5',
   },
   navTab: {
     flex: 1,
@@ -2482,18 +3368,19 @@ const styles = StyleSheet.create({
     borderBottomColor: 'transparent',
   },
   navTabActive: {
-    borderBottomColor: '#0f766e',
+    borderBottomColor: '#5F8FC9',
   },
   navTabText: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#627d98',
+    color: '#5F8FC9',
   },
   navTabTextActive: {
-    color: '#0f766e',
+    color: '#274B74',
   },
   pageContainer: {
     flex: 1,
+    backgroundColor: '#EAF4FF',
   },
   pageContent: {
     paddingHorizontal: 16,
@@ -2501,124 +3388,52 @@ const styles = StyleSheet.create({
     paddingBottom: 20,
   },
   accountContainer: {
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
-    padding: 16,
-    gap: 10,
+    flex: 1,
+    alignItems: 'center',
+    padding: 20,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 10,
   },
   accountAvatar: {
-    alignSelf: 'center',
-    width: 84,
-    height: 84,
-    borderRadius: 42,
-    borderWidth: 2,
-    borderColor: '#0f766e',
-    alignItems: 'center',
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    backgroundColor: '#DCEAFF',
     justifyContent: 'center',
-    marginBottom: 6,
-    backgroundColor: '#f0fdfa',
+    alignItems: 'center',
+    marginBottom: 20,
   },
   accountAvatarHead: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: '#0f766e',
-    marginBottom: 6,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#5F8FC9',
   },
   accountAvatarBody: {
-    width: 34,
-    height: 18,
-    borderTopLeftRadius: 14,
-    borderTopRightRadius: 14,
-    backgroundColor: '#0f766e',
+    width: 70,
+    height: 40,
+    backgroundColor: '#5F8FC9',
+    borderBottomLeftRadius: 35,
+    borderBottomRightRadius: 35,
   },
   accountTitle: {
-    fontSize: 20,
+    fontSize: 22,
     fontWeight: '700',
-    color: '#102a43',
-    textAlign: 'center',
-  },
-  accountSubtitle: {
-    fontSize: 14,
-    color: '#627d98',
-    textAlign: 'center',
-    marginBottom: 8,
-  },
-  carteInfo: {
-    fontSize: 14,
-    color: '#627d98',
-    marginBottom: 16,
-    marginTop: 2,
-  },
-  locationCard: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
-    padding: 14,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 10,
-  },
-  locationCardLeft: {
-    flex: 1,
-  },
-  locationName: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#102a43',
+    color: '#274B74',
     marginBottom: 4,
   },
-  locationCoords: {
-    fontSize: 13,
-    color: '#627d98',
-    fontFamily: 'monospace',
-  },
-  locationTime: {
-    fontSize: 12,
-    color: '#9fb3c8',
-    marginTop: 6,
-  },
-  locationIndicator: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#bcccdc',
-    marginLeft: 12,
-  },
-  locationIndicatorCurrent: {
-    backgroundColor: '#0f766e',
-  },
-  emptyText: {
-    fontSize: 16,
-    color: '#9fb3c8',
+  accountSubtitle: {
+    fontSize: 15,
+    color: '#5F8FC9',
+    marginBottom: 20,
     textAlign: 'center',
-    marginTop: 20,
   },
   carteContainer: {
     flex: 1,
-    position: 'relative',
+    backgroundColor: '#EAF4FF',
   },
   map: {
-    flex: 1,
-  },
-  mapNotice: {
-    position: 'absolute',
-    top: 16,
-    left: 16,
-    right: 16,
-    backgroundColor: 'rgba(16, 42, 67, 0.88)',
-    borderRadius: 10,
-    padding: 12,
-  },
-  mapNoticeText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '600',
-    lineHeight: 18,
+    ...StyleSheet.absoluteFillObject,
   },
   mapWebFallback: {
     flex: 1,
@@ -2634,47 +3449,189 @@ const styles = StyleSheet.create({
   mapWebFallbackTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: '#f0f4f8',
+    color: '#274B74',
   },
   mapWebFallbackText: {
     fontSize: 14,
-    color: '#d9e2ec',
-    lineHeight: 20,
+    color: '#5F8FC9',
+    textAlign: 'center',
+    paddingHorizontal: 20,
   },
   mapWebFallbackCoords: {
-    fontSize: 14,
-    color: '#9fb3c8',
+    fontSize: 12,
+    color: '#5F8FC9',
+    marginTop: 8,
+  },
+  recenterButton: {
+    position: 'absolute',
+    right: 16,
+    bottom: 132,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: 'rgba(95, 143, 201, 0.95)',
+    zIndex: 30,
+    elevation: 8,
+  },
+  recenterButtonText: {
+    color: '#ffffff',
     fontWeight: '600',
   },
-  mapPlaceholder: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#f0f0f0',
+  mapNotice: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    padding: 10,
+    borderRadius: 8,
   },
-  mapPlaceholderText: {
+  mapNoticeText: {
+    color: '#274B74',
+    textAlign: 'center',
+  },
+  participantPanel: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    padding: 16,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    zIndex: 40,
+    elevation: 5,
+  },
+  participantPanelActive: {
+    backgroundColor: 'rgba(234, 244, 255, 0.98)',
+  },
+  participantPanelTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#274B74',
+    marginBottom: 12,
+  },
+  eventSelectorRow: {
+    gap: 12,
+    paddingBottom: 12,
+  },
+  eventSelectorCard: {
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#C9DEF5',
+  },
+  eventSelectorCardActive: {
+    backgroundColor: '#E8F1F9',
+    borderColor: '#000000',
+    borderWidth: 2,
+  },
+  eventSelectorTitle: {
     fontSize: 16,
-    color: '#627d98',
+    fontWeight: '600',
+    color: '#274B74',
+  },
+  eventSelectorMeta: {
+    fontSize: 13,
+    color: '#5F8FC9',
+  },
+  modeSwitchRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
+  },
+  modeButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#5F8FC9',
+  },
+  modeButtonActive: {
+    backgroundColor: '#5F8FC9',
+  },
+  modeButtonText: {
+    color: '#5F8FC9',
+    fontWeight: '600',
+  },
+  modeButtonTextActive: {
+    color: '#FFFFFF',
+  },
+  navigationMetricsCard: {
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    borderRadius: 10,
+    marginBottom: 12,
+    gap: 4,
+  },
+  navigationMetric: {
+    fontSize: 15,
+    color: '#274B74',
+  },
+  navigationMetricAlert: {
+    fontSize: 15,
+    color: '#B71C1C',
+    fontWeight: '600',
+  },
+  actionRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  urgencyButton: {
+    flex: 1,
+    backgroundColor: '#D32F2F',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  urgencyButtonText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  adminEmergencyPanel: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(255, 205, 210, 0.95)',
+    padding: 12,
+    borderRadius: 8,
+  },
+  adminEmergencyTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#B71C1C',
+    marginBottom: 8,
+  },
+  adminEmergencyItemButton: {
+    paddingVertical: 4,
+  },
+  adminEmergencyItem: {
+    color: '#B71C1C',
   },
   legend: {
     position: 'absolute',
-    bottom: 20,
-    left: 16,
-    right: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
-    borderRadius: 10,
-    padding: 12,
-    gap: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-    elevation: 5,
+    bottom: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    padding: 10,
+    borderRadius: 8,
+    gap: 6,
+    zIndex: 10,
+    elevation: 2,
   },
   legendItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
   },
   legendColor: {
     width: 16,
@@ -2682,56 +3639,8 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   legendText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#102a43',
-  },
-  participantPanel: {
-    position: 'absolute',
-    left: 12,
-    right: 12,
-    bottom: 148,
-    backgroundColor: 'rgba(255, 255, 255, 0.97)',
-    borderRadius: 12,
-    padding: 10,
-    gap: 8,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-  },
-  participantPanelActive: {
-    bottom: 8,
-    paddingVertical: 8,
-    gap: 6,
-  },
-  participantPanelTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#102a43',
-  },
-  eventSelectorRow: {
-    gap: 8,
-  },
-  eventSelectorCard: {
-    minWidth: 150,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-    padding: 10,
-    backgroundColor: '#ffffff',
-  },
-  eventSelectorCardActive: {
-    borderColor: '#0f766e',
-    backgroundColor: '#f0fdfa',
-  },
-  eventSelectorTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#102a43',
-  },
-  eventSelectorMeta: {
-    fontSize: 12,
-    color: '#627d98',
-    marginTop: 4,
+    fontSize: 13,
+    color: '#274B74',
   },
   participantArrowContainer: {
     width: 30,
@@ -2741,277 +3650,108 @@ const styles = StyleSheet.create({
   },
   participantArrowGlyph: {
     fontSize: 28,
-    fontWeight: '900',
-    lineHeight: 28,
+    textShadowColor: 'rgba(0, 0, 0, 0.5)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
   },
-  navigationMetricsCard: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
-    padding: 10,
-    gap: 4,
+  eventFieldGroup: {
+    marginBottom: 10,
   },
-  navigationMetric: {
-    fontSize: 13,
-    color: '#334e68',
-    fontWeight: '600',
-  },
-  navigationMetricAlert: {
-    fontSize: 13,
-    color: '#b91c1c',
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  modeSwitchRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  modeButton: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#9fb3c8',
-    borderRadius: 999,
-    paddingVertical: 8,
-    alignItems: 'center',
-    backgroundColor: '#ffffff',
-  },
-  modeButtonActive: {
-    backgroundColor: '#0f766e',
-    borderColor: '#0f766e',
-  },
-  modeButtonText: {
-    color: '#334e68',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  modeButtonTextActive: {
-    color: '#ffffff',
-  },
-  actionRow: {
-    flexDirection: 'row',
-    gap: 8,
-    alignItems: 'center',
-  },
-  urgencyButton: {
-    flex: 1,
-    borderRadius: 10,
-    backgroundColor: '#dc2626',
-    paddingVertical: 11,
-    alignItems: 'center',
-  },
-  urgencyButtonText: {
-    color: '#ffffff',
-    fontWeight: '700',
+  eventFieldLabel: {
     fontSize: 14,
-  },
-  adminEmergencyPanel: {
-    position: 'absolute',
-    top: 16,
-    right: 16,
-    left: 16,
-    backgroundColor: 'rgba(127, 29, 29, 0.92)',
-    borderRadius: 10,
-    padding: 10,
-    gap: 6,
-  },
-  adminEmergencyTitle: {
-    color: '#fee2e2',
-    fontWeight: '700',
-    fontSize: 13,
-  },
-  adminEmergencyItemButton: {
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    backgroundColor: 'rgba(239, 68, 68, 0.22)',
-  },
-  adminEmergencyItem: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  recenterButton: {
-    position: 'absolute',
-    right: 16,
-    bottom: 132,
-    borderRadius: 999,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    backgroundColor: 'rgba(15, 118, 110, 0.95)',
-    zIndex: 30,
-    elevation: 8,
-  },
-  recenterButtonText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  focusContainer: {
-    flex: 1,
-    padding: 18,
-    backgroundColor: '#061b2b',
-    gap: 14,
-    justifyContent: 'center',
-  },
-  focusEmergencyWrap: {
-    position: 'absolute',
-    top: 14,
-    right: 14,
-    zIndex: 2,
-  },
-  focusUrgencyButton: {
-    borderRadius: 999,
-    backgroundColor: '#dc2626',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-  },
-  focusUrgencyButtonText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  focusTitle: {
-    color: '#e0f2fe',
-    fontSize: 24,
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-  focusSubtitle: {
-    color: '#bae6fd',
-    textAlign: 'center',
-    fontSize: 14,
-    marginBottom: 8,
-  },
-  focusArrowFrame: {
-    alignSelf: 'center',
-    width: 180,
-    height: 180,
-    borderRadius: 90,
-    borderWidth: 2,
-    borderColor: '#1d4ed8',
-    backgroundColor: '#0c4a6e',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.35,
-    shadowRadius: 8,
-    elevation: 7,
-  },
-  focusArrow: {
-    width: 0,
-    height: 0,
-    borderLeftWidth: 24,
-    borderRightWidth: 24,
-    borderBottomWidth: 70,
-    borderLeftColor: 'transparent',
-    borderRightColor: 'transparent',
-    borderBottomColor: '#93c5fd',
+    color: '#5F8FC9',
+    marginBottom: 4,
   },
   fieldRow: {
     flexDirection: 'row',
-    gap: 10,
-  },
-  eventFieldGroup: {
-    gap: 6,
-  },
-  eventFieldLabel: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#334e68',
+    gap: 12,
   },
   halfInput: {
     flex: 1,
-  },
-  selectorDateField: {
-    backgroundColor: '#f0fdfa',
-    borderColor: '#0f766e',
-  },
-  gpxInput: {
-    minHeight: 140,
-  },
-  gpxPreviewBox: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
-    padding: 12,
-    gap: 6,
-    marginBottom: 8,
-  },
-  gpxPreviewLabel: {
-    fontSize: 12,
-    textTransform: 'uppercase',
-    letterSpacing: 0.4,
-    color: '#9fb3c8',
-    fontWeight: '700',
-  },
-  gpxPreviewText: {
-    fontSize: 14,
-    color: '#334e68',
-    lineHeight: 20,
-  },
-  helperText: {
-    fontSize: 13,
-    color: '#627d98',
-    marginTop: 6,
-    marginBottom: 8,
   },
   checkboxRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    marginTop: 6,
-    marginBottom: 10,
+    marginVertical: 6,
   },
   checkbox: {
-    width: 22,
-    height: 22,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#9fb3c8',
-    backgroundColor: '#ffffff',
-    alignItems: 'center',
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#5F8FC9',
     justifyContent: 'center',
+    alignItems: 'center',
+  },
+  offlineNotice: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(255, 152, 0, 0.95)',
+    padding: 10,
+    borderRadius: 8,
+    zIndex: 20,
+  },
+  offlineNoticeText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    textAlign: 'center',
   },
   checkboxActive: {
-    borderColor: '#0f766e',
-    backgroundColor: '#e6fffb',
+    backgroundColor: '#5F8FC9',
   },
   checkboxDot: {
     width: 12,
     height: 12,
     borderRadius: 6,
-    backgroundColor: '#0f766e',
+    backgroundColor: '#FFFFFF',
   },
   checkboxLabel: {
     fontSize: 15,
-    color: '#334e68',
+    color: '#274B74',
+  },
+  helperText: {
+    fontSize: 13,
+    color: '#5F8FC9',
+    marginTop: 4,
+    marginBottom: 10,
+  },
+  gpxPreviewBox: {
+    backgroundColor: '#FFFFFF',
+    padding: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#C9DEF5',
+    marginBottom: 12,
+  },
+  gpxPreviewLabel: {
+    fontSize: 13,
     fontWeight: '600',
+    color: '#5F8FC9',
+  },
+  gpxPreviewText: {
+    fontSize: 14,
+    color: '#274B74',
+    marginTop: 2,
   },
   eventList: {
-    gap: 10,
-    marginBottom: 8,
+    gap: 12,
+    marginBottom: 20,
   },
   eventCard: {
+    backgroundColor: '#FFFFFF',
     borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#d9e2ec',
-    backgroundColor: '#ffffff',
     padding: 12,
-    gap: 6,
+    borderWidth: 1,
+    borderColor: '#C9DEF5',
   },
   eventCardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    gap: 10,
-  },
-  eventHeaderActions: {
-    alignItems: 'flex-end',
-    gap: 8,
+    marginBottom: 6,
   },
   eventCardTitleBlock: {
     flex: 1,
@@ -3019,35 +3759,108 @@ const styles = StyleSheet.create({
   eventCardTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#102a43',
+    color: '#274B74',
   },
   eventCardMeta: {
     fontSize: 13,
-    color: '#627d98',
-    marginTop: 2,
+    color: '#5F8FC9',
+  },
+  eventHeaderActions: {
+    alignItems: 'flex-end',
+    gap: 8,
   },
   eventBadge: {
-    backgroundColor: '#e6fffb',
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    backgroundColor: '#DCEAFF',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
   },
   eventBadgeText: {
-    color: '#0f766e',
-    fontSize: 12,
-    fontWeight: '700',
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#5F8FC9',
   },
   deleteEventButton: {
-    borderWidth: 1,
-    borderColor: '#ef4444',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    backgroundColor: '#fff1f2',
+    backgroundColor: '#FFCDD2',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
   },
   deleteEventButtonText: {
-    color: '#b91c1c',
+    color: '#B71C1C',
+    fontWeight: '600',
     fontSize: 12,
+  },
+  emptyText: {
+    textAlign: 'center',
+    color: '#5F8FC9',
+    marginVertical: 10,
+  },
+  navigationStats: {
+    position: 'absolute',
+    bottom: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(39, 75, 116, 0.95)',
+    padding: 12,
+    borderRadius: 12,
+    gap: 10,
+    zIndex: 35,
+    elevation: 5,
+  },
+  statsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'space-between',
+  },
+  statCard: {
+    flex: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  statLabel: {
+    fontSize: 11,
+    color: 'rgba(255, 255, 255, 0.7)',
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  statValue: {
+    fontSize: 14,
     fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  emergencyButtonSmall: {
+    backgroundColor: '#D32F2F',
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    borderRadius: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+    minHeight: 50,
+  },
+  emergencyButtonSmallText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 11,
+    textAlign: 'center',
+  },
+  stopButtonSmall: {
+    backgroundColor: '#5F8FC9',
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    borderRadius: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+    minHeight: 50,
+  },
+  stopButtonSmallText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 11,
+    textAlign: 'center',
   },
 });
+

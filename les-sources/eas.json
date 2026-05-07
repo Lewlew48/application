@@ -1,6 +1,6 @@
 {
   "cli": {
-    "version": ">= 16.20.0",
+    "version": ">= 18.8.1",
     "appVersionSource": "remote"
   },
   "build": {
@@ -22,7 +22,8 @@
     "production": {
       "android": {
         "track": "internal"
-      }
+      },
+      "ios": {}
     }
   }
 }
